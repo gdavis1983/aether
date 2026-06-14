@@ -1,31 +1,51 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, utilityProcess } = require('electron');
 const path = require('path');
-const { fork } = require('child_process');
+const fs = require('fs');
 const { autoUpdater } = require('electron-updater');
 
 let serverProcess = null;
 let mainWindow = null;
+
+// File logging for packaged app diagnostics
+const logFile = path.join(app.getPath('userData'), 'main-process.log');
+function log(msg) {
+  try {
+    fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`);
+    console.log(msg);
+  } catch (e) {
+    console.error('Failed to write log:', e);
+  }
+}
 
 // Disable auto-download of updates so the user is prompted first
 autoUpdater.autoDownload = false;
 
 function startBackendServer() {
   const serverPath = path.join(__dirname, 'backend', 'server.js');
+  log(`Spawning backend server from path: ${serverPath}`);
   
-  // Spawn backend using Electron's Node runtime
-  serverProcess = fork(serverPath, [], {
-    env: {
-      ...process.env,
-      AETHER_USER_DATA_PATH: app.getPath('userData'),
-      PORT: '5000',
-      NODE_ENV: app.isPackaged ? 'production' : 'development'
-    },
-    stdio: 'inherit' // Pipe logs to terminal
-  });
+  try {
+    // Spawn backend using Electron's utilityProcess to support ASAR execution
+    serverProcess = utilityProcess.fork(serverPath, [], {
+      env: {
+        ...process.env,
+        AETHER_USER_DATA_PATH: app.getPath('userData'),
+        PORT: '5000',
+        NODE_ENV: app.isPackaged ? 'production' : 'development'
+      },
+      stdio: 'inherit'
+    });
 
-  serverProcess.on('exit', (code, signal) => {
-    console.log(`Backend server exited with code ${code} and signal ${signal}`);
-  });
+    serverProcess.on('spawn', () => {
+      log('Backend server process spawned successfully.');
+    });
+
+    serverProcess.on('exit', (code) => {
+      log(`Backend server exited with code ${code}`);
+    });
+  } catch (err) {
+    log(`Failed to fork backend server: ${err.message}`);
+  }
 }
 
 function createWindow() {
