@@ -4,14 +4,14 @@
   "description": "An AI-powered cryptocurrency trading bot and dashboard with simulated paper trading and backtesting.",
   "main": "main.js",
   "scripts": {
-    "install-all": "npm.cmd install && npm.cmd install --prefix backend && npm.cmd install --prefix frontend",
+    "install-all": "npm install && npm install --prefix backend && npm install --prefix frontend",
     "server": "node backend/server.js",
-    "client": "npm.cmd run dev --prefix frontend",
-    "dev": "concurrently \"npm.cmd run server\" \"npm.cmd run client\"",
+    "client": "npm run dev --prefix frontend",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
     "telegram-logs": "node backend/send_logs_telegram.js",
     "electron": "electron .",
-    "build-frontend": "npm.cmd run build --prefix frontend",
-    "dist": "npm.cmd run build-frontend && electron-builder",
+    "build-frontend": "npm run build --prefix frontend",
+    "dist": "npm run build-frontend && electron-builder",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
