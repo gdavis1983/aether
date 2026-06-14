@@ -9,6 +9,8 @@ jobs:
   release:
     name: Build & Release App
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
 
     strategy:
       matrix:
@@ -26,13 +28,13 @@ jobs:
 
       # Install dependencies for all folders
       - name: Install Root Dependencies
-        run: npm ci
+        run: npm install
 
       - name: Install Backend Dependencies
-        run: npm ci --prefix backend
+        run: npm install --prefix backend
 
       - name: Install Frontend Dependencies
-        run: npm ci --prefix frontend
+        run: npm install --prefix frontend
 
       # Compile frontend files
       - name: Compile React Frontend
