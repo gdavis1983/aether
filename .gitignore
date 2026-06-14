@@ -1,0 +1,39 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+web_stage/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+dist/
+build/
+out/
+
+# Database files & local trade logs
+backend/db.json
+backend/logs/
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS / Cache files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+.npm/
+.eslintcache
+.gemini/
+antigravity/

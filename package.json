@@ -1,0 +1,62 @@
+{
+  "name": "ai-crypto-trading-bot",
+  "version": "1.0.0",
+  "description": "An AI-powered cryptocurrency trading bot and dashboard with simulated paper trading and backtesting.",
+  "main": "main.js",
+  "scripts": {
+    "install-all": "npm.cmd install && npm.cmd install --prefix backend && npm.cmd install --prefix frontend",
+    "server": "node backend/server.js",
+    "client": "npm.cmd run dev --prefix frontend",
+    "dev": "concurrently \"npm.cmd run server\" \"npm.cmd run client\"",
+    "telegram-logs": "node backend/send_logs_telegram.js",
+    "electron": "electron .",
+    "build-frontend": "npm.cmd run build --prefix frontend",
+    "dist": "npm.cmd run build-frontend && electron-builder",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "concurrently": "^8.2.2",
+    "electron-updater": "^6.8.9"
+  },
+  "devDependencies": {
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.aether.tradingbot",
+    "productName": "AetherBot",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "backend/**",
+      "!backend/node_modules/**",
+      "frontend/dist/**",
+      "package.json",
+      "Aether_Operations_Manual.md"
+    ],
+    "asar": true,
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.finance"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "gdavis1983",
+      "repo": "aether"
+    }
+  }
+}

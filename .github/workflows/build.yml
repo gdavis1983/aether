@@ -1,0 +1,46 @@
+name: Build and Release Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build & Release App
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Check out Git Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # Install dependencies for all folders
+      - name: Install Root Dependencies
+        run: npm ci
+
+      - name: Install Backend Dependencies
+        run: npm ci --prefix backend
+
+      - name: Install Frontend Dependencies
+        run: npm ci --prefix frontend
+
+      # Compile frontend files
+      - name: Compile React Frontend
+        run: npm run build-frontend
+
+      # Build & Publish the app using electron-builder
+      # It will automatically draft a GitHub Release and upload the .exe and .dmg
+      - name: Build & Publish App
+        run: npx electron-builder --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

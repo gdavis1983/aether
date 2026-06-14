@@ -1,0 +1,19 @@
+{
+  "name": "ai-crypto-trading-bot-backend",
+  "version": "1.0.0",
+  "description": "Express server and bot runtime for the AI Crypto Trading Bot",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "telegram-logs": "node send_logs_telegram.js"
+  },
+  "dependencies": {
+    "ccxt": "^4.4.24",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^8.0.11"
+  }
+}
