@@ -3,14 +3,20 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const ccxt = require('ccxt');
+const vm = require('vm');
 const dotenv = require('dotenv');
 
 const { calculateSMA, calculateEMA, calculateRSI, calculateMACD, calculateAwesomeOscillator, calculateFibonacciLevels, calculateElliottWaves, calculateATR, calculateADX, calculateRelativeVolume } = require('./indicators');
-const { getTradingDecision, askBrainQuestion } = require('./brain');
-const { sendTelegramAlert, sendSMSAlert } = require('./notifications');
+const { getTradingDecision, askBrainQuestion, runAIChatCompletion } = require('./brain');
+const { sendTelegramAlert, sendSMSAlert, sendDiscordWebhook } = require('./notifications');
 
 // Load environment variables if available
 dotenv.config();
+
+function escapeHTML(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 const app = express();
 app.use(cors());
@@ -19,10 +25,18 @@ app.use(express.json());
 const userDataPath = process.env.AETHER_USER_DATA_PATH;
 const DB_PATH = userDataPath ? path.join(userDataPath, 'db.json') : path.join(__dirname, 'db.json');
 const LOGS_DIR = userDataPath ? path.join(userDataPath, 'logs') : path.join(__dirname, 'logs');
+const TOOLS_PATH = userDataPath ? path.join(userDataPath, 'tools') : path.join(__dirname, 'tools');
+const STRATEGIES_PATH = userDataPath ? path.join(userDataPath, 'strategies') : path.join(__dirname, 'strategies');
 
-// Create logs directory if it doesn't exist
+// Create required directories if they don't exist
 if (!fs.existsSync(LOGS_DIR)) {
   fs.mkdirSync(LOGS_DIR, { recursive: true });
+}
+if (!fs.existsSync(TOOLS_PATH)) {
+  fs.mkdirSync(TOOLS_PATH, { recursive: true });
+}
+if (!fs.existsSync(STRATEGIES_PATH)) {
+  fs.mkdirSync(STRATEGIES_PATH, { recursive: true });
 }
 
 // Migrate database file if running in Electron and AppData db.json doesn't exist yet
@@ -38,10 +52,54 @@ if (userDataPath && !fs.existsSync(DB_PATH)) {
   }
 }
 
+// Default system configurations for backward compatibility
+const defaultSettings = {
+  geminiApiKey: "",
+  openaiApiKey: "",
+  claudeApiKey: "",
+  activeLlmProvider: "gemini",
+  activeLlmModel: "gemini-2.5-flash",
+  enabledTools: [],
+  enabledStrategies: [],
+  selectedAsset: "BTC/USD",
+  selectedTimeframe: "1h",
+  tradingMode: "paper",
+  botIntervalMin: 60,
+  botEnabled: false,
+  maxTradeSizePct: 10,
+  stopLossPct: 10,
+  customPrompt: "",
+  exchangeName: "coinbase",
+  exchangeApiKey: "",
+  exchangeApiSecret: "",
+  notificationType: "none",
+  phoneNumber: "",
+  phoneCarrier: "att",
+  telegramBotToken: "",
+  telegramChatId: "",
+  smtpHost: "",
+  smtpPort: "465",
+  smtpUser: "",
+  smtpPass: "",
+  multiTimeframeEnabled: false,
+  macroTimeframe: "1d",
+  trailingStopEnabled: true,
+  trailingStopPct: 4.0,
+  takeProfitEnabled: false,
+  takeProfitPct: 10.0,
+  atrStopEnabled: true,
+  atrStopMultiplier: 2.0,
+  newsSentimentEnabled: false,
+  maxPositionAllocationPct: 75
+};
+
 // Bot interval runtime state
 let botIntervalId = null;
 let isBotRunning = false;
+let forceNextCycle = false;
 let lastBalanceSyncTime = 0; // Throttle live balance API checks
+let multiTimeframeCache = null;
+let lastMultiTimeframeSync = 0;
 
 // Helpers to read/write local database
 function readDB() {
@@ -50,10 +108,33 @@ function readDB() {
       throw new Error("db.json does not exist");
     }
     const data = fs.readFileSync(DB_PATH, 'utf8');
-    return JSON.parse(data);
+    const parsed = JSON.parse(data);
+    if (parsed) {
+      if (parsed.settings) {
+        parsed.settings = { ...defaultSettings, ...parsed.settings };
+      }
+      if (!parsed.chatMessages) {
+        parsed.chatMessages = [];
+      }
+      if (!parsed.conditionalOrders) {
+        parsed.conditionalOrders = [];
+      }
+      if (!parsed.customTradingRules) {
+        parsed.customTradingRules = [];
+      }
+    }
+    return parsed;
   } catch (err) {
     console.error("Error reading database:", err);
-    return { portfolio: { balanceUSD: 10000, positions: {} }, trades: [], logs: [], settings: {} };
+    return { 
+      portfolio: { balanceUSD: 10000, positions: {} }, 
+      trades: [], 
+      logs: [], 
+      settings: { ...defaultSettings }, 
+      chatMessages: [],
+      conditionalOrders: [],
+      customTradingRules: []
+    };
   }
 }
 
@@ -229,12 +310,62 @@ async function fetchCryptoNews() {
 }
 
 /**
+ * Aggregate 1-hour candles into 4-hour candles aligned on standard UTC boundaries
+ */
+function aggregateCandles(candlesRaw1h, multiplier = 4) {
+  const buckets = {};
+  for (const c of candlesRaw1h) {
+    if (!c || c.length < 6) continue;
+    const timestamp = c[0];
+    const date = new Date(timestamp);
+    const utcHours = date.getUTCHours();
+    const bucketHours = Math.floor(utcHours / multiplier) * multiplier;
+    
+    const bucketDate = new Date(date);
+    bucketDate.setUTCHours(bucketHours, 0, 0, 0);
+    const bucketTimestamp = bucketDate.getTime();
+    
+    if (!buckets[bucketTimestamp]) {
+      buckets[bucketTimestamp] = [];
+    }
+    buckets[bucketTimestamp].push(c);
+  }
+  
+  const sortedTimestamps = Object.keys(buckets).map(Number).sort((a, b) => a - b);
+  const aggregated = [];
+  
+  for (const t of sortedTimestamps) {
+    const chunk = buckets[t];
+    if (chunk.length === 0) continue;
+    
+    const open = chunk[0][1];
+    const close = chunk[chunk.length - 1][4];
+    const high = Math.max(...chunk.map(c => c[2]));
+    const low = Math.min(...chunk.map(c => c[3]));
+    const volume = chunk.reduce((sum, c) => sum + (c[5] || 0), 0);
+    
+    aggregated.push([t, open, high, low, close, volume]);
+  }
+  
+  return aggregated;
+}
+
+/**
  * Fetch historical candles and calculate indicators
  */
-async function getMarketContext(exchange, symbol, timeframe, limit = 100) {
+async function getMarketContext(exchange, symbol, timeframe, limit = 200) {
   try {
     // CCXT fetchOHLCV returns: [ [timestamp, open, high, low, close, volume], ... ]
-    const candlesRaw = await exchange.fetchOHLCV(symbol, timeframe, undefined, limit);
+    let candlesRaw;
+    if (timeframe === '4h') {
+      const raw1h = await exchange.fetchOHLCV(symbol, '1h', undefined, limit * 4 + 4);
+      candlesRaw = aggregateCandles(raw1h, 4);
+      if (candlesRaw.length > limit) {
+        candlesRaw = candlesRaw.slice(-limit);
+      }
+    } else {
+      candlesRaw = await exchange.fetchOHLCV(symbol, timeframe, undefined, limit);
+    }
     if (!candlesRaw || candlesRaw.length === 0) {
       throw new Error(`No candle data returned from exchange for ${symbol} (${timeframe})`);
     }
@@ -257,7 +388,7 @@ async function getMarketContext(exchange, symbol, timeframe, limit = 100) {
       rsi: calculateRSI(closePrices, 14),
       macd: calculateMACD(closePrices, 12, 26, 9),
       ao: calculateAwesomeOscillator(candles),
-      fib: calculateFibonacciLevels(candles, 50),
+      fib: calculateFibonacciLevels(candles, 150),
       atr: calculateATR(candles, 14),
       adx: calculateADX(candles, 14),
       rvol: calculateRelativeVolume(candles, 20)
@@ -295,7 +426,46 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
       return { success: false, message: "Insufficient USD balance to place a meaningful trade (must be > $10)." };
     }
 
-    const allocation = availableCash * (amountPct / 100);
+    let allocation = availableCash * (amountPct / 100);
+    
+    // Enforce Max Position Allocation Cap for paper trading
+    const maxAllocPct = db.settings?.maxPositionAllocationPct !== undefined ? db.settings.maxPositionAllocationPct : 75;
+    let isCapped = false;
+    let capLimit = 0;
+    if (maxAllocPct > 0 && maxAllocPct < 100) {
+      const holdings = db.portfolio.positions[assetName]?.amount || 0;
+      const currentHoldingsValue = holdings * currentPrice;
+      const totalPortfolioValue = availableCash + currentHoldingsValue;
+      const maxHoldingsValueAllowed = totalPortfolioValue * (maxAllocPct / 100);
+      const remainingAllowedPurchaseVal = maxHoldingsValueAllowed - currentHoldingsValue;
+      
+      if (remainingAllowedPurchaseVal <= 0) {
+        return { success: false, message: `Cannot place paper BUY: Max Position Allocation Cap of ${maxAllocPct}% reached (Current: ${(currentHoldingsValue / totalPortfolioValue * 100).toFixed(1)}%).` };
+      }
+      
+      if (allocation > remainingAllowedPurchaseVal) {
+        addLog('info', `Capping paper BUY order size from $${allocation.toFixed(2)} to $${remainingAllowedPurchaseVal.toFixed(2)} to respect Max Position Allocation Cap of ${maxAllocPct}%.`);
+        allocation = remainingAllowedPurchaseVal;
+        isCapped = true;
+        capLimit = remainingAllowedPurchaseVal;
+      }
+    }
+
+    if (allocation < 10.0 && availableCash >= 10.0) {
+      if (isCapped) {
+        if (capLimit < 10.0) {
+          return { success: false, message: `Cannot place paper BUY: Capped size of $${capLimit.toFixed(2)} (due to Max Position Allocation Cap of ${maxAllocPct}%) is below paper minimum of $10.00.` };
+        } else {
+          allocation = 10.0;
+        }
+      } else {
+        allocation = 10.0;
+      }
+    }
+    if (allocation > availableCash) {
+      allocation = availableCash;
+    }
+
     const fee = allocation * feePct;
     const netAllocation = allocation - fee;
     const buyAmount = netAllocation / currentPrice;
@@ -343,6 +513,9 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
 
     if (pos.amount <= 0.00001) {
       delete db.portfolio.positions[assetName];
+      if (db.highestPriceReached && db.highestPriceReached[assetName]) {
+        delete db.highestPriceReached[assetName];
+      }
     }
 
     tradeDetails = {
@@ -396,8 +569,40 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
 
       // Calculate purchase cost in quote currency (USD/USDC)
       let allocation = availableCash * (amountPct / 100);
+      
+      // Enforce Max Position Allocation Cap (respecting total portfolio value)
+      const maxAllocPct = db.settings?.maxPositionAllocationPct !== undefined ? db.settings.maxPositionAllocationPct : 75;
+      let isCapped = false;
+      let capLimit = 0;
+      if (maxAllocPct > 0 && maxAllocPct < 100) {
+        const liveHoldings = balance.total[assetName] || balance.free[assetName] || 0;
+        const currentHoldingsValue = liveHoldings * currentPrice;
+        const totalPortfolioValue = availableCash + currentHoldingsValue;
+        const maxHoldingsValueAllowed = totalPortfolioValue * (maxAllocPct / 100);
+        const remainingAllowedPurchaseVal = maxHoldingsValueAllowed - currentHoldingsValue;
+        
+        if (remainingAllowedPurchaseVal <= 0) {
+          throw new Error(`Cannot place BUY order: Max Position Allocation Cap of ${maxAllocPct}% reached (Current: ${(currentHoldingsValue / totalPortfolioValue * 100).toFixed(1)}% | XRP Value: $${currentHoldingsValue.toFixed(2)} | Portfolio: $${totalPortfolioValue.toFixed(2)}).`);
+        }
+        
+        if (allocation > remainingAllowedPurchaseVal) {
+          addLog('info', `Capping BUY order size from $${allocation.toFixed(2)} to $${remainingAllowedPurchaseVal.toFixed(2)} to respect Max Position Allocation Cap of ${maxAllocPct}%.`);
+          allocation = remainingAllowedPurchaseVal;
+          isCapped = true;
+          capLimit = remainingAllowedPurchaseVal;
+        }
+      }
+
       if (allocation < 5.0 && availableCash >= 5.0) {
-        allocation = 5.0; // Auto scale up to exchange minimum
+        if (isCapped) {
+          if (capLimit < 5.0) {
+            throw new Error(`Cannot place BUY order: Capped size of $${capLimit.toFixed(2)} (due to Max Position Allocation Cap of ${maxAllocPct}%) is below Coinbase minimum of $5.00.`);
+          } else {
+            allocation = 5.0;
+          }
+        } else {
+          allocation = 5.0; // Auto scale up to exchange minimum
+        }
       }
       if (allocation > availableCash) {
         allocation = availableCash;
@@ -427,7 +632,7 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
       };
 
     } else if (action === 'SELL') {
-      const holdings = balance.free[assetName] || 0;
+      const holdings = balance.total[assetName] || balance.free[assetName] || 0;
 
       if (holdings <= 0.00001) {
         throw new Error(`No live holdings found for ${assetName} in Coinbase account.`);
@@ -502,15 +707,30 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
       if (!db.portfolio.positions) db.portfolio.positions = {};
       
       if (action === 'BUY') {
-        const liveAssetAmount = updatedBalance.free[assetName] || 0;
+        const liveAssetAmount = updatedBalance.total[assetName] || updatedBalance.free[assetName] || 0;
+        const oldPos = db.portfolio.positions[assetName] || { amount: 0, avgEntryPrice: 0 };
+        const oldAmount = oldPos.amount || 0;
+        const oldAvg = oldPos.avgEntryPrice || 0;
+        const fillAmount = orderDetails.amount;
+        const fillPrice = orderDetails.price;
+        
+        const totalAmount = oldAmount + fillAmount;
+        let newAvgPrice = fillPrice;
+        if (totalAmount > 0) {
+          newAvgPrice = ((oldAmount * oldAvg) + (fillAmount * fillPrice)) / totalAmount;
+        }
+
         db.portfolio.positions[assetName] = {
           amount: liveAssetAmount,
-          avgEntryPrice: orderDetails.price
+          avgEntryPrice: Number(newAvgPrice.toFixed(6))
         };
       } else if (action === 'SELL') {
-        const liveAssetAmount = updatedBalance.free[assetName] || 0;
+        const liveAssetAmount = updatedBalance.total[assetName] || updatedBalance.free[assetName] || 0;
         if (liveAssetAmount <= 0.00001) {
           delete db.portfolio.positions[assetName];
+          if (db.highestPriceReached && db.highestPriceReached[assetName]) {
+            delete db.highestPriceReached[assetName];
+          }
         } else {
           db.portfolio.positions[assetName] = {
             amount: liveAssetAmount,
@@ -556,7 +776,7 @@ async function runBotCycle() {
 
   try {
     const exchange = getExchangeInstance(settings);
-    let marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 100);
+    let marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 200);
     const currentPrice = marketData.ticker.close;
 
     // Calculate Market Regime Indicators
@@ -626,7 +846,7 @@ async function runBotCycle() {
       } else {
         addLog('info', `Macro memory bank expired/missing. Fetching fresh daily candles...`);
         try {
-          const macroContextRaw = await getMarketContext(exchange, settings.selectedAsset, macroTimeframe, 100);
+          const macroContextRaw = await getMarketContext(exchange, settings.selectedAsset, macroTimeframe, 200);
           const macroData = {
             timeframe: macroTimeframe,
             indicators: macroContextRaw.indicators,
@@ -636,13 +856,14 @@ async function runBotCycle() {
           
           // Update database cache
           try {
-            db.macroCache = {
+            const freshDb = readDB();
+            freshDb.macroCache = {
               timestamp: new Date().toISOString(),
               symbol: settings.selectedAsset,
               timeframe: macroTimeframe,
               data: macroData
             };
-            writeDB(db);
+            writeDB(freshDb);
           } catch (cacheErr) {
             console.error("Failed to write macro cache to db:", cacheErr.message);
           }
@@ -654,7 +875,7 @@ async function runBotCycle() {
 
     // Safety checks: Stop Loss, ATR Stop, Trailing Stop, and Take Profit
     const pos = db.portfolio.positions[assetName];
-    if (pos && pos.amount > 0) {
+    if (pos && pos.amount > 0 && pos.avgEntryPrice > 0) {
       if (!db.highestPriceReached) db.highestPriceReached = {};
       const lastHigh = db.highestPriceReached[assetName] || 0;
       if (currentPrice > lastHigh) {
@@ -729,10 +950,71 @@ async function runBotCycle() {
         return;
       }
     } else {
-      if (db.highestPriceReached && db.highestPriceReached[assetName]) {
-        delete db.highestPriceReached[assetName];
-        writeDB(db);
+      const freshDb = readDB();
+      if (freshDb.highestPriceReached && freshDb.highestPriceReached[assetName]) {
+        delete freshDb.highestPriceReached[assetName];
+        writeDB(freshDb);
       }
+    }
+    
+    // --- CANDLE BOUNDARY SKIP CHECK ---
+    const latestCandle = marketData.recentCandles[marketData.recentCandles.length - 1];
+    const latestCandleTime = latestCandle ? latestCandle.time : null;
+
+    if (!forceNextCycle && latestCandleTime && db.latestDecision) {
+      const isSameAsset = db.latestDecision.symbol === settings.selectedAsset;
+      const isSameTimeframe = db.latestDecision.timeframe === settings.selectedTimeframe;
+      const isSameCandle = db.latestDecision.candleTime === latestCandleTime;
+
+      if (isSameAsset && isSameTimeframe && isSameCandle) {
+        addLog('info', `Skipping Gemini Brain analysis: Already evaluated candle at ${new Date(latestCandleTime).toISOString()} for ${settings.selectedAsset} (${settings.selectedTimeframe}).`);
+        return;
+      }
+    }
+    
+    // Reset force run flag if it was active
+    forceNextCycle = false;
+
+    // Smart Token Bypass Check
+    const availableCash = db.portfolio.balanceUSD;
+    const currentHoldings = pos ? pos.amount : 0;
+    const minBuyAmount = settings.tradingMode === 'live' ? 5.0 : 10.0;
+    const hasNoHoldings = currentHoldings <= 0.00001;
+    const hasNoCash = availableCash < minBuyAmount;
+
+    if (hasNoHoldings && hasNoCash) {
+      addLog('info', `Skipping Gemini API call: Trade impossible (No XRP holdings to SELL and insufficient cash [$${availableCash.toFixed(2)}] to BUY). Defaulting to HOLD.`);
+      
+      const freshDb = readDB();
+      freshDb.latestDecision = {
+        decision: "HOLD",
+        reasoning: `Skipped Gemini API call: No holdings to sell (XRP balance: ${currentHoldings.toFixed(4)}) and cash balance ($${availableCash.toFixed(2)}) is below the required minimum of $${minBuyAmount.toFixed(2)} to place a buy order.`,
+        confidence: 1.0,
+        amount_pct: 0,
+        market_structure: "N/A - Insufficient funds",
+        support_level: 0,
+        resistance_level: 0,
+        news_sentiment_score: 0,
+        risk_reward_ratio: 0,
+        timestamp: new Date().toISOString(),
+        symbol: settings.selectedAsset,
+        timeframe: settings.selectedTimeframe,
+        candleTime: latestCandleTime,
+        indicators: {
+          rsi: marketData.indicators.rsi[marketData.indicators.rsi.length - 1],
+          sma9: marketData.indicators.sma9[marketData.indicators.sma9.length - 1],
+          sma21: marketData.indicators.sma21[marketData.indicators.sma21.length - 1],
+          ao: marketData.indicators.ao ? marketData.indicators.ao[marketData.indicators.ao.length - 1] : null,
+          macd: marketData.indicators.macd.histogram[marketData.indicators.macd.histogram.length - 1],
+          atr: marketData.indicators.atr[marketData.indicators.atr.length - 1],
+          adx: currentADX,
+          rvol: currentRVol,
+          marketRegime: marketRegime
+        },
+        news: []
+      };
+      writeDB(freshDb);
+      return;
     }
 
     // Fetch news sentiment if enabled
@@ -753,9 +1035,13 @@ async function runBotCycle() {
     const analysis = await getTradingDecision(apiKey, marketData, db.portfolio, settings, (msg) => addLog('warning', msg));
     
     // Save latest AI diagnostic data to database
-    db.latestDecision = {
+    const freshDb = readDB();
+    freshDb.latestDecision = {
       ...analysis,
       timestamp: new Date().toISOString(),
+      symbol: settings.selectedAsset,
+      timeframe: settings.selectedTimeframe,
+      candleTime: latestCandleTime,
       indicators: {
         rsi: marketData.indicators.rsi[marketData.indicators.rsi.length - 1],
         sma9: marketData.indicators.sma9[marketData.indicators.sma9.length - 1],
@@ -769,23 +1055,17 @@ async function runBotCycle() {
       },
       news: marketData.news || []
     };
-    writeDB(db);
+    writeDB(freshDb);
     
     addLog('brain', `Gemini Decision: ${analysis.decision} | Confidence: ${(analysis.confidence * 100).toFixed(0)}% | Amount Allocation: ${analysis.amount_pct}%`);
     addLog('brain', `Gemini Rationale: "${analysis.reasoning}"`);
 
     // Send real-time phone alerts
     if (settings.notificationType !== 'none' && analysis.decision !== 'HOLD') {
-      const msg = `🚀 <b>AETHER EW BOT SIGNAL: ${analysis.decision}</b>\n\n` +
-                  `Asset: <b>${settings.selectedAsset}</b>\n` +
-                  `Price: <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b>\n` +
-                  `Confidence: <b>${(analysis.confidence * 100).toFixed(0)}%</b>\n` +
-                  `Allocation: <b>${analysis.amount_pct}%</b>\n` +
-                  `📈 <b>Structure:</b> ${analysis.market_structure}\n` +
-                  `🛡️ <b>Key Zones:</b> Support $${analysis.support_level.toLocaleString()} | Resist $${analysis.resistance_level.toLocaleString()}\n` +
-                  `📊 <b>Risk-to-Reward:</b> ${analysis.risk_reward_ratio}\n` +
-                  `📰 <b>News Sentiment:</b> ${analysis.news_sentiment_score > 0 ? '+' : ''}${analysis.news_sentiment_score}/10\n\n` +
-                  `🧠 <b>Wave Rationale:</b>\n<i>"${analysis.reasoning}"</i>`;
+      const msg = `🚀 <b>AETHER BOT SIGNAL: ${analysis.decision} ${settings.selectedAsset}</b> at <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b> (Confidence: ${(analysis.confidence * 100).toFixed(0)}%, Size: ${analysis.amount_pct}%).\n` +
+                  `📈 <b>Structure:</b> ${escapeHTML(analysis.market_structure)}.\n` +
+                  `🛡️ <b>Key Zones:</b> Support $${analysis.support_level.toLocaleString()} | Resistance $${analysis.resistance_level.toLocaleString()} | Risk/Reward: ${analysis.risk_reward_ratio}.\n` +
+                  `🧠 <b>Rationale:</b> <i>"${escapeHTML(getFirstSentences(analysis.reasoning, 1))}"</i>`;
                   
       const cleanMsg = msg.replace(/<[^>]*>/g, ''); // strip HTML for carrier SMS compatibility
 
@@ -807,6 +1087,15 @@ async function runBotCycle() {
       }
     }
 
+    // Send Discord webhook alert (fires independently of primary notification type)
+    if (settings.discordWebhookUrl && analysis.decision !== 'HOLD') {
+      const discordMsg = `🚀 <b>AETHER BOT SIGNAL: ${analysis.decision} ${settings.selectedAsset}</b> at <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b> (Confidence: ${(analysis.confidence * 100).toFixed(0)}%, Size: ${analysis.amount_pct}%).\n` +
+                  `📈 <b>Structure:</b> ${escapeHTML(analysis.market_structure)}.\n` +
+                  `🛡️ <b>Key Zones:</b> Support $${analysis.support_level.toLocaleString()} | Resistance $${analysis.resistance_level.toLocaleString()} | Risk/Reward: ${analysis.risk_reward_ratio}.\n` +
+                  `🧠 <b>Rationale:</b> <i>"${escapeHTML(getFirstSentences(analysis.reasoning, 1))}"</i>`;
+      sendDiscordWebhook(settings.discordWebhookUrl, discordMsg).catch(e => addLog('error', `Discord webhook failed: ${e.message}`));
+    }
+
     if (analysis.decision === 'HOLD') {
       addLog('info', "Bot decision is HOLD. No orders placed.");
       return;
@@ -814,7 +1103,8 @@ async function runBotCycle() {
 
     if (settings.tradingMode === 'paper') {
       // Execute simulated trade
-      const result = executePaperTrade(analysis.decision, analysis.amount_pct, currentPrice, assetName, db, analysis.reasoning);
+      const finalDb = readDB();
+      const result = executePaperTrade(analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, analysis.reasoning);
       if (result.success) {
         addLog('trade', `Paper Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
       } else {
@@ -823,7 +1113,8 @@ async function runBotCycle() {
     } else {
       // Real Live Trading Mode
       try {
-        const result = await executeLiveTrade(exchange, analysis.decision, analysis.amount_pct, currentPrice, assetName, db, settings.selectedAsset, analysis.reasoning);
+        const finalDb = readDB();
+        const result = await executeLiveTrade(exchange, analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning);
         if (result.success) {
           addLog('trade', `Live Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
         }
@@ -864,6 +1155,42 @@ if (fs.existsSync(frontendDistPath)) {
   app.use(express.static(frontendDistPath));
 }
 
+// Helper to calculate active stop and target levels for open positions
+function getActiveTradeStops(pos, settings, latestDecision, highestPrice) {
+  if (!pos || pos.amount <= 0 || pos.avgEntryPrice <= 0) {
+    return null;
+  }
+
+  const stops = {
+    entryPrice: pos.avgEntryPrice,
+    stopLossPrice: null,
+    atrStopPrice: null,
+    trailingStopPrice: null,
+    takeProfitPrice: null,
+    highestPrice: highestPrice || pos.avgEntryPrice
+  };
+
+  if (settings.stopLossPct > 0) {
+    stops.stopLossPrice = pos.avgEntryPrice * (1 - settings.stopLossPct / 100);
+  }
+
+  if (settings.atrStopEnabled && latestDecision && latestDecision.indicators && typeof latestDecision.indicators.atr === 'number') {
+    const atrMultiplier = settings.atrStopMultiplier || 2.0;
+    stops.atrStopPrice = pos.avgEntryPrice - (atrMultiplier * latestDecision.indicators.atr);
+  }
+
+  if (settings.trailingStopEnabled) {
+    const peak = highestPrice || pos.avgEntryPrice;
+    stops.trailingStopPrice = peak * (1 - (settings.trailingStopPct || 2.5) / 100);
+  }
+
+  if (settings.takeProfitEnabled) {
+    stops.takeProfitPrice = pos.avgEntryPrice * (1 + (settings.takeProfitPct || 10.0) / 100);
+  }
+
+  return stops;
+}
+
 // Get bot status and portfolio summary
 app.get('/api/status', async (req, res) => {
   const db = readDB();
@@ -881,21 +1208,30 @@ app.get('/api/status', async (req, res) => {
         const assetName = symbol.split('/')[0];
         const quoteCurrency = symbol.split('/')[1] || 'USD';
         
-        db.portfolio.balanceUSD = balance.free[quoteCurrency] || 0;
+        const freshDb = readDB();
+        freshDb.portfolio.balanceUSD = balance.free[quoteCurrency] || 0;
         
-        if (!db.portfolio.positions) db.portfolio.positions = {};
-        const holdings = balance.free[assetName] || 0;
+        if (!freshDb.portfolio.positions) freshDb.portfolio.positions = {};
+        const holdings = balance.total[assetName] || balance.free[assetName] || 0;
         if (holdings > 0.00001) {
-          const oldEntry = db.portfolio.positions[assetName]?.avgEntryPrice || 0;
-          db.portfolio.positions[assetName] = {
+          let oldEntry = freshDb.portfolio.positions[assetName]?.avgEntryPrice || 0;
+          if (!oldEntry) {
+            try {
+              const ticker = await exchange.fetchTicker(symbol);
+              oldEntry = ticker.last || ticker.close || 0;
+            } catch (pErr) {
+              console.warn("Could not fetch price for new synced position:", pErr.message);
+            }
+          }
+          freshDb.portfolio.positions[assetName] = {
             amount: holdings,
             avgEntryPrice: oldEntry || 0
           };
         } else {
-          delete db.portfolio.positions[assetName];
+          delete freshDb.portfolio.positions[assetName];
         }
         
-        writeDB(db);
+        writeDB(freshDb);
         lastBalanceSyncTime = now;
       } catch (err) {
         console.error("Failed to sync live portfolio balance:", err.message);
@@ -903,21 +1239,31 @@ app.get('/api/status', async (req, res) => {
     }
   }
 
+  const finalDb = readDB();
+  const assetName = finalDb.settings.selectedAsset.split('/')[0];
+  const pos = finalDb.portfolio.positions ? finalDb.portfolio.positions[assetName] : null;
+  const peakPrice = finalDb.highestPriceReached ? finalDb.highestPriceReached[assetName] : null;
+  const activeTradeStops = getActiveTradeStops(pos, finalDb.settings, finalDb.latestDecision, peakPrice);
+
   res.json({
     isBotRunning,
-    portfolio: db.portfolio,
-    highestPriceReached: db.highestPriceReached || {},
-    latestDecision: db.latestDecision || null,
+    portfolio: finalDb.portfolio,
+    highestPriceReached: finalDb.highestPriceReached || {},
+    latestDecision: finalDb.latestDecision || null,
+    activeTradeStops,
     settings: {
-      ...db.settings,
-      geminiApiKey: db.settings.geminiApiKey ? '••••••••' : '',
-      exchangeApiKey: db.settings.exchangeApiKey ? '••••••••' : '',
-      exchangeApiSecret: db.settings.exchangeApiSecret ? '••••••••' : '',
-      telegramBotToken: db.settings.telegramBotToken ? '••••••••' : '',
-      smtpPass: db.settings.smtpPass ? '••••••••' : ''
+      ...finalDb.settings,
+      geminiApiKey: finalDb.settings.geminiApiKey ? '••••••••' : '',
+      openaiApiKey: finalDb.settings.openaiApiKey ? '••••••••' : '',
+      claudeApiKey: finalDb.settings.claudeApiKey ? '••••••••' : '',
+      exchangeApiKey: finalDb.settings.exchangeApiKey ? '••••••••' : '',
+      exchangeApiSecret: finalDb.settings.exchangeApiSecret ? '••••••••' : '',
+      telegramBotToken: finalDb.settings.telegramBotToken ? '••••••••' : '',
+      smtpPass: finalDb.settings.smtpPass ? '••••••••' : ''
     }
   });
 });
+
 
 // Update settings
 app.post('/api/settings', (req, res) => {
@@ -927,10 +1273,13 @@ app.post('/api/settings', (req, res) => {
   // Clean incoming settings: if key is masked, preserve old key
   const updatedSettings = req.body;
   if (updatedSettings.geminiApiKey === '••••••••') updatedSettings.geminiApiKey = oldSettings.geminiApiKey;
+  if (updatedSettings.openaiApiKey === '••••••••') updatedSettings.openaiApiKey = oldSettings.openaiApiKey;
+  if (updatedSettings.claudeApiKey === '••••••••') updatedSettings.claudeApiKey = oldSettings.claudeApiKey;
   if (updatedSettings.exchangeApiKey === '••••••••') updatedSettings.exchangeApiKey = oldSettings.exchangeApiKey;
   if (updatedSettings.exchangeApiSecret === '••••••••') updatedSettings.exchangeApiSecret = oldSettings.exchangeApiSecret;
   if (updatedSettings.telegramBotToken === '••••••••') updatedSettings.telegramBotToken = oldSettings.telegramBotToken;
   if (updatedSettings.smtpPass === '••••••••') updatedSettings.smtpPass = oldSettings.smtpPass;
+  if (updatedSettings.discordWebhookUrl === '••••••••') updatedSettings.discordWebhookUrl = oldSettings.discordWebhookUrl;
 
   db.settings = { ...db.settings, ...updatedSettings };
   writeDB(db);
@@ -939,6 +1288,7 @@ app.post('/api/settings', (req, res) => {
 
   // Restart loop if interval or asset or enabled status changed
   if (db.settings.botEnabled) {
+    forceNextCycle = true;
     startBotLoop(db.settings.botIntervalMin);
   } else {
     stopBotLoop();
@@ -1007,6 +1357,192 @@ app.post('/api/reset-portfolio', (req, res) => {
   res.json({ success: true, portfolio: db.portfolio });
 });
 
+// ----------------------------------------------------
+// CONDITIONAL ORDERS & CUSTOM RULES API
+// ----------------------------------------------------
+
+// Add a conditional order (supports virtual and direct exchange orders)
+app.post('/api/conditional-orders/add', async (req, res) => {
+  const { symbol, action, amountPct, triggerType, triggerValue, executionType, reasoning } = req.body;
+  const assetName = symbol.split('/')[0];
+  
+  try {
+    const db = readDB();
+    const settings = db.settings;
+    const orderId = `order_${Date.now()}`;
+    let exchangeOrderId = null;
+    let amountTokens = 0;
+    
+    // Fetch ticker price to calculate rounded token quantity
+    const exchange = getExchangeInstance(settings);
+    const ticker = await exchange.fetchTicker(symbol);
+    const currentPrice = ticker.last || ticker.close;
+    
+    if (executionType === 'exchange' && settings.tradingMode === 'live') {
+      // Direct Coinbase order requires calculating order size
+      const balance = await exchange.fetchBalance();
+      let allocation = 0;
+      
+      if (action === 'BUY') {
+        const quoteCurrency = symbol.split('/')[1] || 'USD';
+        const availableCash = balance.free[quoteCurrency] || 0;
+        allocation = availableCash * (amountPct / 100);
+      } else {
+        const holdings = balance.total[assetName] || balance.free[assetName] || 0;
+        allocation = holdings * currentPrice * (amountPct / 100);
+      }
+      
+      amountTokens = allocation / triggerValue; // triggerValue is the limit price for direct orders
+      const amountTokensRounded = Number(exchange.amountToPrecision(symbol, amountTokens));
+      
+      if (amountTokensRounded <= 0) {
+        return res.status(400).json({ success: false, error: "Calculated order size is too small for exchange rules." });
+      }
+      
+      addLog('info', `Placing direct limit ${action} order on Coinbase for ${amountTokensRounded} ${assetName} at $${triggerValue}...`);
+      
+      let cbOrder;
+      if (action === 'BUY') {
+        cbOrder = await exchange.createLimitBuyOrder(symbol, amountTokensRounded, triggerValue);
+      } else {
+        cbOrder = await exchange.createLimitSellOrder(symbol, amountTokensRounded, triggerValue);
+      }
+      exchangeOrderId = cbOrder.id;
+      amountTokens = cbOrder.amount || amountTokensRounded;
+    }
+    
+    // Write atomically
+    const freshDb = readDB();
+    if (!freshDb.conditionalOrders) freshDb.conditionalOrders = [];
+    
+    const newOrder = {
+      id: orderId,
+      exchangeOrderId,
+      symbol,
+      action,
+      executionType,
+      triggerType,
+      triggerValue,
+      amountPct,
+      amountTokens: amountTokens || 0,
+      reasoning: reasoning || 'Scheduled order.',
+      timestamp: new Date().toISOString()
+    };
+    
+    freshDb.conditionalOrders.push(newOrder);
+    writeDB(freshDb);
+    
+    addLog('info', `Scheduled ${executionType} ${action} order for ${amountPct}% of ${symbol} successfully.`);
+    res.json({ success: true, message: `Successfully scheduled order ${orderId}`, order: newOrder });
+  } catch (err) {
+    addLog('error', `Failed to schedule conditional order: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Fetch scheduled orders
+app.get('/api/conditional-orders/list', (req, res) => {
+  const db = readDB();
+  res.json(db.conditionalOrders || []);
+});
+
+// Cancel a scheduled order
+app.post('/api/conditional-orders/cancel', async (req, res) => {
+  const { orderId } = req.body;
+  
+  try {
+    const db = readDB();
+    const orderIndex = db.conditionalOrders?.findIndex(o => o.id === orderId);
+    
+    if (orderIndex === undefined || orderIndex === -1) {
+      return res.status(404).json({ success: false, error: "Order not found." });
+    }
+    
+    const order = db.conditionalOrders[orderIndex];
+    if (order.executionType === 'exchange' && order.exchangeOrderId && db.settings.tradingMode === 'live') {
+      try {
+        const exchange = getExchangeInstance(db.settings);
+        addLog('info', `Canceling direct limit order on Coinbase with ID: ${order.exchangeOrderId}...`);
+        await exchange.cancelOrder(order.exchangeOrderId, order.symbol);
+      } catch (err) {
+        addLog('warning', `Failed to cancel order directly on Coinbase exchange: ${err.message}`);
+      }
+    }
+    
+    // Write atomically
+    const freshDb = readDB();
+    freshDb.conditionalOrders = freshDb.conditionalOrders.filter(o => o.id !== orderId);
+    writeDB(freshDb);
+    
+    addLog('info', `Canceled scheduled order ${orderId} successfully.`);
+    res.json({ success: true, message: `Successfully canceled order ${orderId}` });
+  } catch (err) {
+    addLog('error', `Failed to cancel order: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Add a custom strategy rule
+app.post('/api/custom-rules/add', (req, res) => {
+  const { rule } = req.body;
+  if (!rule || typeof rule !== 'string') {
+    return res.status(400).json({ success: false, error: "Invalid rule format." });
+  }
+  
+  const freshDb = readDB();
+  if (!freshDb.customTradingRules) freshDb.customTradingRules = [];
+  
+  freshDb.customTradingRules.push(rule);
+  writeDB(freshDb);
+  
+  addLog('info', `Learned new persistent strategy rule: "${rule}"`);
+  
+  if (isBotRunning) {
+    forceNextCycle = true;
+    runBotCycle();
+  }
+  
+  res.json({ success: true, message: "Rule added successfully.", rules: freshDb.customTradingRules });
+});
+
+// Fetch custom rules
+app.get('/api/custom-rules/list', (req, res) => {
+  const db = readDB();
+  res.json(db.customTradingRules || []);
+});
+
+// Delete a custom rule
+app.post('/api/custom-rules/delete', (req, res) => {
+  const { index } = req.body; // index is 0-indexed
+  
+  const freshDb = readDB();
+  if (!freshDb.customTradingRules || index === undefined || index < 0 || index >= freshDb.customTradingRules.length) {
+    return res.status(400).json({ success: false, error: "Invalid rule index." });
+  }
+  
+  const removedRule = freshDb.customTradingRules.splice(index, 1);
+  writeDB(freshDb);
+  
+  addLog('info', `Removed strategy rule: "${removedRule}"`);
+  
+  if (isBotRunning) {
+    forceNextCycle = true;
+    runBotCycle();
+  }
+  
+  res.json({ success: true, message: "Rule deleted successfully.", rules: freshDb.customTradingRules });
+});
+
+// Force run the bot cycle immediately
+app.post('/api/bot/force-run', (req, res) => {
+  if (!isBotRunning) {
+    return res.status(400).json({ success: false, error: "Bot loop is not running. Please start the bot first." });
+  }
+  forceNextCycle = true;
+  runBotCycle();
+  res.json({ success: true, message: "Immediate bot execution cycle triggered successfully." });
+});
+
 // Manual buy/sell override
 app.post('/api/trade/manual', async (req, res) => {
   const { action, amountPct, symbol } = req.body;
@@ -1020,11 +1556,13 @@ app.post('/api/trade/manual', async (req, res) => {
     const currentPrice = ticker.last || ticker.close;
 
     if (settings.tradingMode === 'live') {
-      const result = await executeLiveTrade(exchange, action, amountPct, currentPrice, assetName, db, symbol, `REST API manual override ${action} command.`);
+      const finalDb = readDB();
+      const result = await executeLiveTrade(exchange, action, amountPct, currentPrice, assetName, finalDb, symbol, `REST API manual override ${action} command.`);
       addLog('trade', `[MANUAL LIVE ORDER] Executed ${action} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
       res.json({ success: true, trade: result.trade });
     } else {
-      const result = executePaperTrade(action, amountPct, currentPrice, assetName, db, `REST API manual override ${action} command.`);
+      const finalDb = readDB();
+      const result = executePaperTrade(action, amountPct, currentPrice, assetName, finalDb, `REST API manual override ${action} command.`);
       if (result.success) {
         addLog('trade', `[MANUAL ORDER] Executed ${action} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
         res.json({ success: true, trade: result.trade });
@@ -1052,6 +1590,7 @@ app.post('/api/test-alert', async (req, res) => {
     if (incoming.exchangeApiSecret === '••••••••') incoming.exchangeApiSecret = oldSettings.exchangeApiSecret;
     if (incoming.telegramBotToken === '••••••••') incoming.telegramBotToken = oldSettings.telegramBotToken;
     if (incoming.smtpPass === '••••••••') incoming.smtpPass = oldSettings.smtpPass;
+    if (incoming.discordWebhookUrl === '••••••••') incoming.discordWebhookUrl = oldSettings.discordWebhookUrl;
     settings = { ...oldSettings, ...incoming };
   }
 
@@ -1060,9 +1599,11 @@ app.post('/api/test-alert', async (req, res) => {
   const cleanMsg = msg.replace(/<[^>]*>/g, '');
 
   try {
+    const results = [];
+
     if (type === 'telegram') {
       await sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, msg);
-      res.json({ success: true, message: "Test Telegram notification sent!" });
+      results.push('Telegram');
     } else if (type === 'sms') {
       const smtpConfig = {
         host: settings.smtpHost,
@@ -1071,12 +1612,116 @@ app.post('/api/test-alert', async (req, res) => {
         pass: settings.smtpPass
       };
       await sendSMSAlert(smtpConfig, settings.phoneNumber, settings.phoneCarrier, cleanMsg);
-      res.json({ success: true, message: "Test SMS notification sent!" });
+      results.push('SMS');
+    }
+
+    // Also test Discord webhook if configured
+    if (settings.discordWebhookUrl) {
+      await sendDiscordWebhook(settings.discordWebhookUrl, msg);
+      results.push('Discord');
+    }
+
+    if (results.length === 0) {
+      res.status(400).json({ success: false, message: "Notifications are disabled. Change 'Notification Type' in Settings or add a Discord Webhook URL first." });
     } else {
-      res.status(400).json({ success: false, message: "Notifications are disabled. Change 'Notification Type' in Settings first." });
+      res.json({ success: true, message: `Test notification sent via: ${results.join(', ')}!` });
     }
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+function getFirstSentences(text, count = 2) {
+  if (!text) return "";
+  const sentences = text.match(/[^.!?]+[.!?]+(\s|$)/g) || [text];
+  return sentences.slice(0, count).map(s => s.trim()).join(" ");
+}
+
+function classifyRegime(price, indicators) {
+  const latestADXArr = indicators.adx.adx;
+  const latestPlusDIArr = indicators.adx.plusDI;
+  const latestMinusDIArr = indicators.adx.minusDI;
+  const latestRVolArr = indicators.rvol;
+  const sma21Arr = indicators.sma21;
+
+  const currentADX = latestADXArr[latestADXArr.length - 1];
+  const currentPlusDI = latestPlusDIArr[latestPlusDIArr.length - 1];
+  const currentMinusDI = latestMinusDIArr[latestMinusDIArr.length - 1];
+  const currentRVol = latestRVolArr[latestRVolArr.length - 1];
+  const currentSma21 = sma21Arr[sma21Arr.length - 1];
+  
+  const prevADX = latestADXArr[latestADXArr.length - 2] || currentADX;
+  const isADXRising = currentADX > prevADX;
+
+  if (currentADX !== null && currentADX !== undefined) {
+    if (currentADX > 25) {
+      if (currentPlusDI > currentMinusDI && price > currentSma21) {
+        return "TRENDING_BULLISH";
+      } else if (currentMinusDI > currentPlusDI && price < currentSma21) {
+        return "TRENDING_BEARISH";
+      } else {
+        return "STRONG_TREND_CONSOLIDATION";
+      }
+    } else if (currentADX < 20) {
+      return "CHOPPY_RANGE";
+    } else {
+      if (isADXRising && currentRVol > 1.5) {
+        return "HIGH_VOLATILITY_SQUEEZE";
+      } else {
+        return "TRANSITIONING_ZONE";
+      }
+    }
+  }
+  return "TRANSITIONING_ZONE";
+}
+
+// Fetch multi-timeframe indicators for the matrix widget
+app.get('/api/market/multi-indicators', async (req, res) => {
+  try {
+    const db = readDB();
+    const symbol = db.settings.selectedAsset;
+    
+    // Check cache (45 seconds limit)
+    const now = Date.now();
+    if (multiTimeframeCache && (now - lastMultiTimeframeSync < 45000)) {
+      return res.json(multiTimeframeCache);
+    }
+
+    const exchange = getExchangeInstance(db.settings);
+    const timeframes = ['15m', '1h', '4h', '1d'];
+    const results = {};
+
+    for (const tf of timeframes) {
+      const data = await getMarketContext(exchange, symbol, tf, 100);
+      const closePrices = data.recentCandles.map(c => c.close);
+      const lastPrice = closePrices[closePrices.length - 1];
+      
+      const rsiVal = data.indicators.rsi[data.indicators.rsi.length - 1];
+      const adxVal = data.indicators.adx.adx[data.indicators.adx.adx.length - 1];
+      const sma9Val = data.indicators.sma9[data.indicators.sma9.length - 1];
+      const sma21Val = data.indicators.sma21[data.indicators.sma21.length - 1];
+      const macdVal = data.indicators.macd.histogram[data.indicators.macd.histogram.length - 1];
+      const rvolVal = data.indicators.rvol[data.indicators.rvol.length - 1];
+      
+      const regime = classifyRegime(lastPrice, data.indicators);
+      
+      results[tf] = {
+        price: lastPrice,
+        rsi: rsiVal,
+        adx: adxVal,
+        sma9: sma9Val,
+        sma21: sma21Val,
+        macd: macdVal,
+        rvol: rvolVal,
+        regime: regime
+      };
+    }
+
+    multiTimeframeCache = results;
+    lastMultiTimeframeSync = now;
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: `Failed to load multi-timeframe indicators: ${err.message}` });
   }
 });
 
@@ -1086,7 +1731,18 @@ app.get('/api/market/candles', async (req, res) => {
   const db = readDB();
   try {
     const exchange = getExchangeInstance(db.settings);
-    const candlesRaw = await exchange.fetchOHLCV(symbol || 'BTC/USD', timeframe || '1h', undefined, Number(limit) || 100);
+    const limitNum = Number(limit) || 100;
+    
+    let candlesRaw;
+    if (timeframe === '4h') {
+      const raw1h = await exchange.fetchOHLCV(symbol || 'BTC/USD', '1h', undefined, limitNum * 4 + 4);
+      candlesRaw = aggregateCandles(raw1h, 4);
+      if (candlesRaw.length > limitNum) {
+        candlesRaw = candlesRaw.slice(-limitNum);
+      }
+    } else {
+      candlesRaw = await exchange.fetchOHLCV(symbol || 'BTC/USD', timeframe || '1h', undefined, limitNum);
+    }
     const candles = candlesRaw.map(c => ({
       time: c[0] / 1000, // lightweight-charts expects seconds for unix time
       open: c[1],
@@ -1099,6 +1755,348 @@ app.get('/api/market/candles', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ----------------------------------------------------
+// CUSTOM TOOLS & PLUGINS APIs
+// ----------------------------------------------------
+
+// Get all custom tools
+app.get('/api/tools', (req, res) => {
+  try {
+    const files = fs.readdirSync(TOOLS_PATH).filter(f => f.endsWith('.js'));
+    const db = readDB();
+    const tools = files.map(f => {
+      const filePath = path.join(TOOLS_PATH, f);
+      try {
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        const sandbox = { module: { exports: {} }, exports: {} };
+        const context = vm.createContext(sandbox);
+        const script = new vm.Script(fileContent);
+        script.runInContext(context, { timeout: 1000 });
+        const tool = sandbox.module.exports;
+        return {
+          filename: f,
+          name: tool.name || f,
+          description: tool.description || "No description.",
+          parameters: tool.parameters || { type: "object", properties: {} },
+          enabled: (db.settings.enabledTools || []).includes(f)
+        };
+      } catch (err) {
+        return {
+          filename: f,
+          name: f,
+          description: `Error loading tool script: ${err.message}`,
+          parameters: { type: "object", properties: {} },
+          enabled: false,
+          error: true
+        };
+      }
+    });
+    res.json(tools);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Upload a new custom tool (.js)
+app.post('/api/tools/upload', (req, res) => {
+  let { filename, code } = req.body;
+  if (!filename || !code) {
+    return res.status(400).json({ success: false, error: "Filename and code contents are required." });
+  }
+  
+  if (!filename.endsWith('.js')) {
+    filename += '.js';
+  }
+  filename = path.basename(filename).replace(/[^a-zA-Z0-9_.-]/g, '_');
+
+  // Validate JavaScript syntax, properties, and execution structure
+  try {
+    const sandbox = { module: { exports: {} }, exports: {} };
+    const context = vm.createContext(sandbox);
+    const script = new vm.Script(code);
+    script.runInContext(context, { timeout: 1000 });
+    const tool = sandbox.module.exports;
+    
+    if (!tool.name || typeof tool.name !== 'string') {
+      throw new Error("Tool must export a string 'name'");
+    }
+    if (!tool.description || typeof tool.description !== 'string') {
+      throw new Error("Tool must export a string 'description'");
+    }
+    if (typeof tool.execute !== 'function') {
+      throw new Error("Tool must export an 'execute' function");
+    }
+  } catch (err) {
+    return res.status(400).json({ success: false, error: `Invalid tool script: ${err.message}` });
+  }
+
+  try {
+    fs.writeFileSync(path.join(TOOLS_PATH, filename), code, 'utf8');
+    
+    // Auto-enable the newly uploaded tool
+    const db = readDB();
+    if (!db.settings.enabledTools) db.settings.enabledTools = [];
+    if (!db.settings.enabledTools.includes(filename)) {
+      db.settings.enabledTools.push(filename);
+      writeDB(db);
+    }
+    
+    res.json({ success: true, filename });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Toggle a custom tool's enabled state
+app.post('/api/tools/:filename/toggle', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const db = readDB();
+  if (!db.settings.enabledTools) db.settings.enabledTools = [];
+  
+  const idx = db.settings.enabledTools.indexOf(filename);
+  if (idx > -1) {
+    db.settings.enabledTools.splice(idx, 1);
+  } else {
+    db.settings.enabledTools.push(filename);
+  }
+  writeDB(db);
+  res.json({ success: true, enabled: db.settings.enabledTools.includes(filename) });
+});
+
+// Delete a custom tool
+app.delete('/api/tools/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const filePath = path.join(TOOLS_PATH, filename);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    const db = readDB();
+    if (!db.settings.enabledTools) db.settings.enabledTools = [];
+    db.settings.enabledTools = db.settings.enabledTools.filter(f => f !== filename);
+    writeDB(db);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// STRATEGY GUIDELINES APIs (.md)
+// ----------------------------------------------------
+
+// Get all strategy guidelines
+app.get('/api/strategies', (req, res) => {
+  try {
+    const files = fs.readdirSync(STRATEGIES_PATH).filter(f => f.endsWith('.md'));
+    const db = readDB();
+    const strategies = files.map(f => {
+      const filePath = path.join(STRATEGIES_PATH, f);
+      const content = fs.readFileSync(filePath, 'utf8');
+      const lines = content.split('\n');
+      let description = "No description provided.";
+      const descLine = lines.find(l => l.trim() && !l.trim().startsWith('#'));
+      if (descLine) {
+        description = descLine.trim().slice(0, 150);
+        if (descLine.length > 150) description += '...';
+      }
+      return {
+        filename: f,
+        title: f.replace('.md', '').replace(/_/g, ' '),
+        description,
+        content,
+        enabled: (db.settings.enabledStrategies || []).includes(f)
+      };
+    });
+    res.json(strategies);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Upload a strategy guideline (.md)
+app.post('/api/strategies/upload', (req, res) => {
+  let { filename, content } = req.body;
+  if (!filename || !content) {
+    return res.status(400).json({ success: false, error: "Filename and markdown contents are required." });
+  }
+
+  if (!filename.endsWith('.md')) {
+    filename += '.md';
+  }
+  filename = path.basename(filename).replace(/[^a-zA-Z0-9_.-]/g, '_');
+
+  // Enforce size limit (10KB)
+  if (Buffer.byteLength(content, 'utf8') > 10240) {
+    return res.status(400).json({ success: false, error: "Strategy guideline file exceeds 10KB size limit." });
+  }
+
+  try {
+    fs.writeFileSync(path.join(STRATEGIES_PATH, filename), content, 'utf8');
+    
+    // Auto-enable
+    const db = readDB();
+    if (!db.settings.enabledStrategies) db.settings.enabledStrategies = [];
+    if (!db.settings.enabledStrategies.includes(filename)) {
+      db.settings.enabledStrategies.push(filename);
+      writeDB(db);
+    }
+    
+    res.json({ success: true, filename });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Toggle strategy guideline active state
+app.post('/api/strategies/:filename/toggle', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const db = readDB();
+  if (!db.settings.enabledStrategies) db.settings.enabledStrategies = [];
+  
+  const idx = db.settings.enabledStrategies.indexOf(filename);
+  if (idx > -1) {
+    db.settings.enabledStrategies.splice(idx, 1);
+  } else {
+    db.settings.enabledStrategies.push(filename);
+  }
+  writeDB(db);
+  res.json({ success: true, enabled: db.settings.enabledStrategies.includes(filename) });
+});
+
+// Delete strategy guideline
+app.delete('/api/strategies/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const filePath = path.join(STRATEGIES_PATH, filename);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    const db = readDB();
+    if (!db.settings.enabledStrategies) db.settings.enabledStrategies = [];
+    db.settings.enabledStrategies = db.settings.enabledStrategies.filter(f => f !== filename);
+    writeDB(db);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// CONVERSATIONAL AI CHAT API
+// ----------------------------------------------------
+app.post('/api/chat', async (req, res) => {
+  const { messages } = req.body;
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: "Invalid conversation thread." });
+  }
+
+  const db = readDB();
+  const settings = db.settings;
+  const provider = settings.activeLlmProvider || "gemini";
+  
+  let apiKey = "";
+  if (provider === "gemini") {
+    apiKey = settings.geminiApiKey || process.env.GEMINI_API_KEY;
+  } else if (provider === "openai") {
+    apiKey = settings.openaiApiKey || process.env.OPENAI_API_KEY;
+  } else if (provider === "claude") {
+    apiKey = settings.claudeApiKey || process.env.CLAUDE_API_KEY;
+  }
+
+  if (!apiKey) {
+    return res.status(400).json({ error: `API Key for ${provider} is missing. Please configure it in Settings.` });
+  }
+
+  try {
+    // Get live exchange data for portfolio status context (if any)
+    const exchange = getExchangeInstance(settings);
+    let marketData = {};
+    try {
+      marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 200);
+      marketData.indicators.currentADX = marketData.indicators.adx.adx[marketData.indicators.adx.adx.length - 1];
+      marketData.indicators.currentRVol = marketData.indicators.rvol[marketData.indicators.rvol.length - 1];
+    } catch (e) {
+      console.warn("Could not load market data for chat context:", e.message);
+    }
+
+    // Sliding window: only send the last 15 messages to the LLM to keep token usage low
+    const contextMessages = messages.slice(-15);
+
+    const result = await runAIChatCompletion({
+      provider,
+      model: settings.activeLlmModel,
+      apiKey,
+      messages: contextMessages,
+      enabledTools: settings.enabledTools || [],
+      enabledStrategies: settings.enabledStrategies || [],
+      marketData,
+      portfolio: db.portfolio,
+      settings,
+      trades: db.trades || []
+    });
+
+    if (result && !result.error) {
+      const freshDb = readDB();
+      const timestamp = Date.now();
+      const userMsg = messages[messages.length - 1];
+      const userMsgWithTime = { role: userMsg.role, content: userMsg.content, timestamp };
+      const assistantMsgWithTime = { role: 'assistant', content: result.response, timestamp };
+      
+      if (!freshDb.chatMessages) {
+        freshDb.chatMessages = [];
+      }
+      freshDb.chatMessages.push(userMsgWithTime);
+      freshDb.chatMessages.push(assistantMsgWithTime);
+      
+      // Auto-prune messages older than 7 days
+      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+      freshDb.chatMessages = freshDb.chatMessages.filter(msg => {
+        if (!msg.timestamp) return true;
+        return (Date.now() - msg.timestamp) < SEVEN_DAYS_MS;
+      });
+      
+      writeDB(freshDb);
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error("Chat API error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get chat messages history
+app.get('/api/chat/history', (req, res) => {
+  const db = readDB();
+  if (db.chatMessages && Array.isArray(db.chatMessages)) {
+    // Auto-prune on retrieval as well
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+    const cleanHistory = db.chatMessages.filter(msg => {
+      if (!msg.timestamp) return true;
+      return (Date.now() - msg.timestamp) < SEVEN_DAYS_MS;
+    });
+    
+    // Save back if changed
+    if (cleanHistory.length !== db.chatMessages.length) {
+      db.chatMessages = cleanHistory;
+      writeDB(db);
+    }
+    
+    res.json(cleanHistory);
+  } else {
+    res.json([]);
+  }
+});
+
+// Clear chat messages history
+app.post('/api/chat/clear', (req, res) => {
+  const db = readDB();
+  db.chatMessages = [];
+  writeDB(db);
+  res.json({ success: true });
 });
 
 // ----------------------------------------------------
@@ -1117,9 +2115,19 @@ app.post('/api/backtest', async (req, res) => {
   try {
     const exchange = getExchangeInstance(db.settings);
     console.log(`Running backtest for ${symbol} | Timeframe: ${timeframe} | Limit: ${limit}`);
+    const limitNum = Number(limit) || 100;
     
     // Fetch raw candles
-    const candlesRaw = await exchange.fetchOHLCV(symbol, timeframe, undefined, Number(limit) || 100);
+    let candlesRaw;
+    if (timeframe === '4h') {
+      const raw1h = await exchange.fetchOHLCV(symbol, '1h', undefined, limitNum * 4 + 4);
+      candlesRaw = aggregateCandles(raw1h, 4);
+      if (candlesRaw.length > limitNum) {
+        candlesRaw = candlesRaw.slice(-limitNum);
+      }
+    } else {
+      candlesRaw = await exchange.fetchOHLCV(symbol, timeframe, undefined, limitNum);
+    }
     if (!candlesRaw || candlesRaw.length < 30) {
       return res.status(400).json({ error: "Insufficient historical data. Need at least 30 candles." });
     }
@@ -1208,7 +2216,7 @@ app.post('/api/backtest', async (req, res) => {
             histogram: macdResult.histogram.slice(0, i + 1)
           },
           ao: aoArr.slice(0, i + 1),
-          fib: calculateFibonacciLevels(slicedCandles, 50)
+          fib: calculateFibonacciLevels(slicedCandles, 150)
         };
 
         const marketDataSlice = {
@@ -1348,7 +2356,11 @@ app.post('/api/backtest', async (req, res) => {
         if (timeframe === '1m') intervalsPerYear = 525600;
         else if (timeframe === '5m') intervalsPerYear = 105120;
         else if (timeframe === '15m') intervalsPerYear = 35040;
+        else if (timeframe === '30m') intervalsPerYear = 17520;
         else if (timeframe === '1h') intervalsPerYear = 8760;
+        else if (timeframe === '2h') intervalsPerYear = 4380;
+        else if (timeframe === '4h') intervalsPerYear = 2190;
+        else if (timeframe === '6h') intervalsPerYear = 1460;
         else if (timeframe === '1d') intervalsPerYear = 365;
         
         sharpeRatio = (meanReturn / stdDev) * Math.sqrt(intervalsPerYear);
@@ -1468,7 +2480,7 @@ async function handleTelegramCommand(text, token, chatId) {
   let firstWord = cleanText.split(' ')[0].toLowerCase();
 
   // Auto prepend slash if first word is a recognized keyword without a slash
-  const keywords = ['buy', 'sell', 'status', 'pause', 'start', 'help'];
+  const keywords = ['buy', 'sell', 'status', 'pause', 'start', 'run', 'cycle', 'help'];
   if (keywords.includes(firstWord)) {
     cleanText = '/' + cleanText;
   }
@@ -1501,6 +2513,7 @@ async function handleTelegramCommand(text, token, chatId) {
                     `/status - Get current portfolio valuation and active safety stops\n` +
                     `/start - Start the automated bot loop\n` +
                     `/pause - Pause the automated bot loop\n` +
+                    `/run - Force run an immediate bot cycle\n` +
                     `/buy &lt;pct&gt; - Execute manual paper/live market buy (e.g. /buy 50)\n` +
                     `/sell &lt;pct&gt; - Execute manual paper/live market sell (e.g. /sell 100)\n` +
                     `/help - Show this help menu`;
@@ -1569,9 +2582,20 @@ async function handleTelegramCommand(text, token, chatId) {
     } else {
       db.settings.botEnabled = true;
       writeDB(db);
+      forceNextCycle = true;
       startBotLoop(settings.botIntervalMin);
       addLog('info', "[TELEGRAM COMMAND] Bot started by user.");
       await sendResp(`▶️ <b>Bot loop successfully started.</b> Polling every ${settings.botIntervalMin} minutes.`);
+    }
+  }
+  
+  else if (cmd === '/run' || cmd === '/cycle') {
+    if (!isBotRunning) {
+      await sendResp(`❌ Bot is paused. Please start it with /start first.`);
+    } else {
+      forceNextCycle = true;
+      runBotCycle();
+      await sendResp(`⚡ <b>Forcing immediate bot execution cycle...</b>`);
     }
   }
   
@@ -1670,7 +2694,7 @@ async function handleTelegramCommand(text, token, chatId) {
 
       if (settings.tradingMode === 'live') {
         const balance = await exchange.fetchBalance();
-        holdings = balance.free[assetName] || 0;
+        holdings = balance.total[assetName] || balance.free[assetName] || 0;
       } else {
         holdings = db.portfolio.positions[assetName]?.amount || 0;
       }
@@ -1720,7 +2744,7 @@ async function handleTelegramCommand(text, token, chatId) {
       }
       
       const exchange = getExchangeInstance(settings);
-      const marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 50);
+      const marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 200);
       
       if (settings.multiTimeframeEnabled) {
         const macroTimeframe = settings.macroTimeframe || "1d";
@@ -1739,7 +2763,7 @@ async function handleTelegramCommand(text, token, chatId) {
           marketData.macroContext = cache.data;
         } else {
           try {
-            const macroContextRaw = await getMarketContext(exchange, settings.selectedAsset, macroTimeframe, 100);
+            const macroContextRaw = await getMarketContext(exchange, settings.selectedAsset, macroTimeframe, 200);
             const macroData = {
               timeframe: macroTimeframe,
               indicators: macroContextRaw.indicators,
@@ -1796,12 +2820,255 @@ function startTelegramCommandListener() {
   }
 }
 
+// ----------------------------------------------------
+// HIGH-FREQUENCY CONDITIONAL ORDER POLLER
+// ----------------------------------------------------
+let conditionalOrderIntervalId = null;
+
+async function pollConditionalOrders() {
+  const db = readDB();
+  const orders = db.conditionalOrders || [];
+  
+  if (orders.length === 0) return;
+  
+  const settings = db.settings;
+  const exchange = getExchangeInstance(settings);
+  
+  // Group orders by symbol to batch ticker queries
+  const symbols = [...new Set(orders.map(o => o.symbol))];
+  const prices = {};
+  
+  // 1. Fetch current prices for all required symbols
+  for (const sym of symbols) {
+    try {
+      const ticker = await exchange.fetchTicker(sym);
+      prices[sym] = ticker.last || ticker.close;
+    } catch (err) {
+      console.error(`[POLLER] Failed to fetch ticker for ${sym}:`, err.message);
+    }
+  }
+  
+  // 2. Process each order
+  for (const order of orders) {
+    const currentPrice = prices[order.symbol];
+    if (currentPrice === undefined && order.executionType === 'virtual') continue;
+    
+    let isTriggered = false;
+    let triggerDetails = "";
+    
+    if (order.executionType === 'virtual') {
+      // Virtual order triggers based on price or time
+      if (order.triggerType === 'price_below' && currentPrice <= order.triggerValue) {
+        isTriggered = true;
+        triggerDetails = `price fell below $${order.triggerValue} (Current: $${currentPrice})`;
+      } else if (order.triggerType === 'price_above' && currentPrice >= order.triggerValue) {
+        isTriggered = true;
+        triggerDetails = `price rose above $${order.triggerValue} (Current: $${currentPrice})`;
+      } else if (order.triggerType === 'time' && Date.now() >= order.triggerValue) {
+        isTriggered = true;
+        triggerDetails = `scheduled execution timeframe reached`;
+      }
+      
+      if (isTriggered) {
+        addLog('info', `[TRIGGER] Virtual conditional order ${order.id} triggered: ${triggerDetails}.`);
+        
+        try {
+          const finalDb = readDB();
+          const assetName = order.symbol.split('/')[0];
+          
+          let tradeRes;
+          if (settings.tradingMode === 'live') {
+            tradeRes = await executeLiveTrade(exchange, order.action, order.amountPct, currentPrice, assetName, finalDb, order.symbol, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+          } else {
+            tradeRes = executePaperTrade(order.action, order.amountPct, currentPrice, assetName, finalDb, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+          }
+          
+          if (tradeRes.success) {
+            // Send Telegram Notification
+            if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
+              const msg = `⚡ <b>AETHER CONDITIONAL ORDER TRIGGERED: ${order.action} ${order.symbol}</b> at <b>$${currentPrice.toLocaleString()}</b> (Size: ${order.amountPct}%).\n` +
+                          `🎯 <b>Trigger Details:</b> ${escapeHTML(triggerDetails)}.\n` +
+                          `🧠 <b>Setup Rationale:</b> <i>"${escapeHTML(getFirstSentences(order.reasoning, 2))}"</i>`;
+              await sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, msg).catch(e => console.error(e));
+            }
+            // Send Discord Webhook Notification
+            if (settings.discordWebhookUrl) {
+              const discMsg = `⚡ <b>AETHER CONDITIONAL ORDER TRIGGERED: ${order.action} ${order.symbol}</b> at <b>$${currentPrice.toLocaleString()}</b> (Size: ${order.amountPct}%).\n` +
+                          `🎯 <b>Trigger Details:</b> ${escapeHTML(triggerDetails)}.\n` +
+                          `🧠 <b>Setup Rationale:</b> <i>"${escapeHTML(getFirstSentences(order.reasoning, 2))}"</i>`;
+              sendDiscordWebhook(settings.discordWebhookUrl, discMsg).catch(e => console.error('Discord webhook error:', e.message));
+            }
+          }
+        } catch (execErr) {
+          addLog('error', `Failed to execute triggered conditional order ${order.id}: ${execErr.message}`);
+        } finally {
+          // Remove order from database atomically
+          const freshDb = readDB();
+          freshDb.conditionalOrders = freshDb.conditionalOrders.filter(o => o.id !== order.id);
+          writeDB(freshDb);
+        }
+      }
+    } else if (order.executionType === 'exchange') {
+      // Exchange order checks if Coinbase has executed it
+      if (settings.tradingMode === 'live' && order.exchangeOrderId) {
+        try {
+          const cbOrder = await exchange.fetchOrder(order.exchangeOrderId, order.symbol);
+          if (cbOrder.status === 'closed') {
+            addLog('info', `[TRIGGER] Coinbase native limit order filled: ${order.exchangeOrderId}`);
+            
+            const finalDb = readDB();
+            const assetName = order.symbol.split('/')[0];
+            const quoteCurrency = order.symbol.split('/')[1] || 'USDC';
+            
+            // Sync final balance from Coinbase
+            const updatedBalance = await exchange.fetchBalance();
+            finalDb.portfolio.balanceUSD = updatedBalance.free[quoteCurrency] || 0;
+            
+            if (!finalDb.portfolio.positions) finalDb.portfolio.positions = {};
+            const liveAssetAmount = updatedBalance.total[assetName] || updatedBalance.free[assetName] || 0;
+            
+            if (liveAssetAmount <= 0.00001) {
+              delete finalDb.portfolio.positions[assetName];
+              if (finalDb.highestPriceReached) {
+                delete finalDb.highestPriceReached[assetName];
+              }
+            } else {
+              const oldPos = finalDb.portfolio.positions[assetName] || { amount: 0, avgEntryPrice: 0 };
+              const oldAmount = oldPos.amount || 0;
+              const oldAvg = oldPos.avgEntryPrice || 0;
+              const fillPrice = cbOrder.price || order.triggerValue;
+              const fillAmount = cbOrder.amount || order.amountTokens;
+              
+              const totalAmount = oldAmount + fillAmount;
+              let newAvgPrice = fillPrice;
+              if (totalAmount > 0) {
+                newAvgPrice = ((oldAmount * oldAvg) + (fillAmount * fillPrice)) / totalAmount;
+              }
+              
+              finalDb.portfolio.positions[assetName] = {
+                amount: liveAssetAmount,
+                avgEntryPrice: Number(newAvgPrice.toFixed(6))
+              };
+            }
+            
+            const orderTotal = cbOrder.cost || (cbOrder.amount * cbOrder.price) || (order.amountTokens * order.triggerValue);
+            const orderFee = (cbOrder.fee && typeof cbOrder.fee.cost === 'number') ? cbOrder.fee.cost : orderTotal * 0.001;
+            
+            const tradeDetails = {
+              timestamp: new Date().toISOString(),
+              symbol: order.symbol,
+              action: order.action,
+              price: cbOrder.price || order.triggerValue,
+              amount: cbOrder.amount || order.amountTokens,
+              total: orderTotal,
+              fee: orderFee,
+              balanceAfter: finalDb.portfolio.balanceUSD,
+              reasoning: `Coinbase native limit order executed. Setup reasoning: ${order.reasoning}`,
+              mode: 'live'
+            };
+            
+            if (order.action === 'SELL') {
+              const oldPos = db.portfolio.positions[assetName];
+              const avgEntry = oldPos ? oldPos.avgEntryPrice : (cbOrder.price || order.triggerValue);
+              const buyCost = tradeDetails.amount * avgEntry;
+              const netProceeds = orderTotal - orderFee;
+              const netReturnVal = netProceeds - buyCost;
+              const netReturnPct = avgEntry > 0 ? (((tradeDetails.price - avgEntry) / avgEntry) * 100) : 0;
+              
+              tradeDetails.netReturnVal = Number(netReturnVal.toFixed(4));
+              tradeDetails.netReturnPct = Number(netReturnPct.toFixed(2));
+              tradeDetails.netReturn = `${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}% ($${netReturnVal.toFixed(2)})`;
+            }
+            
+            finalDb.trades.unshift(tradeDetails);
+            writeDB(finalDb);
+            
+            // Send Telegram alert
+            if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
+              const msg = `⚡ <b>COINBASE LIMIT ORDER FILLED: ${order.action} ${order.symbol}</b> at <b>$${(cbOrder.price || order.triggerValue).toLocaleString()}</b>.\n` +
+                          `📦 <b>Amount:</b> ${(cbOrder.amount || order.amountTokens).toFixed(4)} ${assetName} (Total: $${orderTotal.toFixed(2)}).\n` +
+                          `🧠 <b>Setup Rationale:</b> <i>"${escapeHTML(getFirstSentences(order.reasoning, 2))}"</i>`;
+              await sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, msg).catch(e => console.error(e));
+            }
+            // Send Discord Webhook alert
+            if (settings.discordWebhookUrl) {
+              const discMsg = `⚡ <b>COINBASE LIMIT ORDER FILLED: ${order.action} ${order.symbol}</b> at <b>$${(cbOrder.price || order.triggerValue).toLocaleString()}</b>.\n` +
+                          `📦 <b>Amount:</b> ${(cbOrder.amount || order.amountTokens).toFixed(4)} ${assetName} (Total: $${orderTotal.toFixed(2)}).\n` +
+                          `🧠 <b>Setup Rationale:</b> <i>"${escapeHTML(getFirstSentences(order.reasoning, 2))}"</i>`;
+              sendDiscordWebhook(settings.discordWebhookUrl, discMsg).catch(e => console.error('Discord webhook error:', e.message));
+            }
+            
+            // Remove order atomically
+            const freshDb = readDB();
+            freshDb.conditionalOrders = freshDb.conditionalOrders.filter(o => o.id !== order.id);
+            writeDB(freshDb);
+          } else if (cbOrder.status === 'canceled' || cbOrder.status === 'rejected') {
+            addLog('warning', `[TRIGGER] Coinbase native order ${order.exchangeOrderId} was ${cbOrder.status}. Removing from tracking.`);
+            const freshDb = readDB();
+            freshDb.conditionalOrders = freshDb.conditionalOrders.filter(o => o.id !== order.id);
+            writeDB(freshDb);
+          }
+        } catch (fetchErr) {
+          console.error(`[POLLER] Error fetching order ${order.exchangeOrderId} status from Coinbase:`, fetchErr.message);
+        }
+      } else if (settings.tradingMode === 'paper') {
+        // In paper mode, simulated limit order triggers just like virtual price triggers
+        if (order.triggerType === 'price_below' && currentPrice <= order.triggerValue) {
+          isTriggered = true;
+          triggerDetails = `price fell below simulated limit of $${order.triggerValue} (Current: $${currentPrice})`;
+        } else if (order.triggerType === 'price_above' && currentPrice >= order.triggerValue) {
+          isTriggered = true;
+          triggerDetails = `price rose above simulated limit of $${order.triggerValue} (Current: $${currentPrice})`;
+        }
+        
+        if (isTriggered) {
+          addLog('info', `[TRIGGER] Paper Limit order ${order.id} triggered: ${triggerDetails}.`);
+          try {
+            const finalDb = readDB();
+            const assetName = order.symbol.split('/')[0];
+            const tradeRes = executePaperTrade(order.action, order.amountPct, currentPrice, assetName, finalDb, `Simulated limit order ${order.id}. Setup reasoning: ${order.reasoning}`);
+            if (tradeRes.success) {
+              if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
+                const msg = `⚡ <b>PAPER LIMIT ORDER FILLED: ${order.action} ${order.symbol}</b> at <b>$${currentPrice.toLocaleString()}</b> (Size: ${order.amountPct}%).\n` +
+                            `🧠 <b>Setup Rationale:</b> <i>"${escapeHTML(getFirstSentences(order.reasoning, 2))}"</i>`;
+                await sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, msg).catch(e => console.error(e));
+              }
+              // Send Discord Webhook alert
+              if (settings.discordWebhookUrl) {
+                const discMsg = `⚡ <b>PAPER LIMIT ORDER FILLED: ${order.action} ${order.symbol}</b> at <b>$${currentPrice.toLocaleString()}</b> (Size: ${order.amountPct}%).\n` +
+                            `🧠 <b>Setup Rationale:</b> <i>"${escapeHTML(getFirstSentences(order.reasoning, 2))}"</i>`;
+                sendDiscordWebhook(settings.discordWebhookUrl, discMsg).catch(e => console.error('Discord webhook error:', e.message));
+              }
+            }
+          } catch (paperErr) {
+            addLog('error', `Failed to execute paper limit order ${order.id}: ${paperErr.message}`);
+          } finally {
+            const freshDb = readDB();
+            freshDb.conditionalOrders = freshDb.conditionalOrders.filter(o => o.id !== order.id);
+            writeDB(freshDb);
+          }
+        }
+      }
+    }
+  }
+}
+
+function startConditionalOrderPoller() {
+  if (conditionalOrderIntervalId) {
+    clearInterval(conditionalOrderIntervalId);
+  }
+  // Run checks every 30 seconds for near real-time price monitoring
+  conditionalOrderIntervalId = setInterval(pollConditionalOrders, 30000);
+  console.log("Aether high-frequency conditional order poller started (30s interval).");
+}
+
 // Start bot interval loop if enabled on startup
 const dbOnStart = readDB();
 if (dbOnStart.settings && dbOnStart.settings.botEnabled) {
   startBotLoop(dbOnStart.settings.botIntervalMin);
 }
 startTelegramCommandListener();
+startConditionalOrderPoller();
 
 // Serve index.html for client-side routing fallback (placed after all API routes)
 if (fs.existsSync(frontendDistPath)) {

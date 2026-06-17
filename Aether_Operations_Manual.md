@@ -73,4 +73,5 @@ Capping trade allocations in choppy ranges (maximum 30% size) while scaling up t
 
 * **v1.0.0 (Launch)**: Basic Express/React architecture. CCXT spot trading loop on Coinbase.
 * **v1.1.0 (Quantitative Controls)**: Added ATR stops, Trailing Stops, Take Profits, and two-way Telegram remote controls.
-* **v1.2.0 (Active)**: Implementing ADX market regimes, RVol volume confirmation, Trade Memory Journaling, and this live-updating system manual.
+* **v1.2.0 (Completed)**: Implemented ADX market regimes, RVol volume confirmation, Trade Memory Journaling, Telegram notification formatting, and this live-updating system manual.
+* **v1.3.0 (Active)**: Added running weighted average cost-basis math, 75% maximum position allocation cap, default-enabled Trailing and ATR Stops, Smart Token Bypass pre-screening, and completed user packaging/setup documentation (README.md).

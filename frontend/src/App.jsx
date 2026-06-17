@@ -7,6 +7,7 @@ import {
   Settings as SettingsIcon, 
   RefreshCw, 
   Play, 
+  Pause,
   Square, 
   AlertTriangle, 
   DollarSign, 
@@ -16,7 +17,14 @@ import {
   History,
   Layers,
   HelpCircle,
-  Database
+  Database,
+  MessageSquare,
+  Trash2,
+  UploadCloud,
+  Target,
+  Shield,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers } from 'lightweight-charts';
 
@@ -41,6 +49,17 @@ function getTradingViewSymbol(asset, exchange) {
   const cleanAsset = asset.replace('/', '').toUpperCase();
   const cleanExchange = (exchange || 'coinbase').toUpperCase();
   return `${cleanExchange}:${cleanAsset}`;
+}
+
+// Robust date/time formatter with safety check
+function safeFormatDate(ts, includeTimeOnly = false) {
+  if (!ts) return 'N/A';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return 'N/A';
+  if (includeTimeOnly) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+  return d.toLocaleString();
 }
 
 // Simple inline parser for bold **text**, code `code`, and math $$formulas$$
@@ -288,7 +307,612 @@ function TradingViewWidget({ symbol }) {
   );
 }
 
+// Custom Canvas Candlestick Chart component
+function CustomTradingChart({ candleData, symbol }) {
+  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
+  const [hoverIndex, setHoverIndex] = useState(null);
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const [isHovering, setIsHovering] = useState(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    const handleResize = () => {
+      if (!canvas || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      
+      // Support Retina screens
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      
+      ctx.resetTransform();
+      ctx.scale(dpr, dpr);
+      
+      drawChart(rect.width, rect.height);
+    };
+
+    const drawChart = (width, height) => {
+      ctx.clearRect(0, 0, width, height);
+
+      if (!candleData || candleData.length === 0) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('NO MARKET DATA LOADED', width / 2, height / 2);
+        return;
+      }
+
+      // Price bounds
+      let maxPrice = -Infinity;
+      let minPrice = Infinity;
+      candleData.forEach(c => {
+        if (c.high > maxPrice) maxPrice = c.high;
+        if (c.low < minPrice) minPrice = c.low;
+      });
+
+      // Extra spacing top/bottom
+      const priceDiff = maxPrice - minPrice || 1;
+      maxPrice += priceDiff * 0.08;
+      minPrice -= priceDiff * 0.08;
+
+      // SMAs
+      const sma9 = [];
+      const sma21 = [];
+      for (let i = 0; i < candleData.length; i++) {
+        if (i >= 8) {
+          const sum = candleData.slice(i - 8, i + 1).reduce((acc, c) => acc + c.close, 0);
+          sma9.push({ idx: i, val: sum / 9 });
+        }
+        if (i >= 20) {
+          const sum = candleData.slice(i - 20, i + 1).reduce((acc, c) => acc + c.close, 0);
+          sma21.push({ idx: i, val: sum / 21 });
+        }
+      }
+
+      const paddingRight = 65;
+      const paddingTop = 25;
+      const paddingBottom = 20;
+      const chartWidth = width - paddingRight - 15;
+      const chartHeight = height - paddingTop - paddingBottom;
+
+      const getX = (idx) => 10 + (idx / (candleData.length - 1)) * chartWidth;
+      const getY = (val) => paddingTop + (1 - (val - minPrice) / (maxPrice - minPrice)) * chartHeight;
+
+      // Draw gridlines (Horizontal price lines)
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.02)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+
+      const gridCount = 5;
+      for (let i = 0; i < gridCount; i++) {
+        const priceVal = minPrice + (i / (gridCount - 1)) * (maxPrice - minPrice);
+        const y = getY(priceVal);
+        ctx.beginPath();
+        ctx.moveTo(10, y);
+        ctx.lineTo(width - paddingRight, y);
+        ctx.stroke();
+
+        // Label
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '8px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.setLineDash([]);
+        ctx.fillText(priceVal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), width - paddingRight + 5, y + 3);
+        ctx.setLineDash([4, 4]);
+      }
+      ctx.setLineDash([]);
+
+      // Draw candlesticks
+      const candleWidth = Math.max(2, (chartWidth / candleData.length) * 0.7);
+
+      candleData.forEach((c, idx) => {
+        const x = getX(idx);
+        const yHigh = getY(c.high);
+        const yLow = getY(c.low);
+        const yOpen = getY(c.open);
+        const yClose = getY(c.close);
+
+        const isUp = c.close >= c.open;
+        const color = isUp ? '#FFFFFF' : '#555555';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+
+        // Wick
+        ctx.beginPath();
+        ctx.moveTo(x, yHigh);
+        ctx.lineTo(x, yLow);
+        ctx.stroke();
+
+        // Body
+        ctx.fillStyle = isUp ? 'rgba(255, 255, 255, 0.08)' : '#333333';
+        const bodyH = Math.max(1, Math.abs(yClose - yOpen));
+        const bodyY = Math.min(yOpen, yClose);
+
+        ctx.fillRect(x - candleWidth / 2, bodyY, candleWidth, bodyH);
+        ctx.strokeRect(x - candleWidth / 2, bodyY, candleWidth, bodyH);
+      });
+
+      // Plot SMA 9
+      if (sma9.length > 0) {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'; // Thin White
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        sma9.forEach((pt, sIdx) => {
+          const x = getX(pt.idx);
+          const y = getY(pt.val);
+          if (sIdx === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      // Plot SMA 21
+      if (sma21.length > 0) {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)'; // Thin White SMA 21
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        sma21.forEach((pt, sIdx) => {
+          const x = getX(pt.idx);
+          const y = getY(pt.val);
+          if (sIdx === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      // Draw crosshair details
+      if (isHovering && hoverIndex !== null && hoverIndex >= 0 && hoverIndex < candleData.length) {
+        const c = candleData[hoverIndex];
+        const hX = getX(hoverIndex);
+
+        // Vertical line
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(hX, paddingTop);
+        ctx.lineTo(hX, height - paddingBottom);
+        ctx.stroke();
+
+        // Horizontal line
+        if (mousePos.y >= paddingTop && mousePos.y <= height - paddingBottom) {
+          ctx.beginPath();
+          ctx.moveTo(10, mousePos.y);
+          ctx.lineTo(width - paddingRight, mousePos.y);
+          ctx.stroke();
+
+          // Price label box
+          const hoverPrice = maxPrice - ((mousePos.y - paddingTop) / chartHeight) * (maxPrice - minPrice);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(width - paddingRight + 2, mousePos.y - 7, 58, 14);
+          ctx.fillStyle = '#000000';
+          ctx.font = 'bold 8px "JetBrains Mono", monospace';
+          ctx.fillText(hoverPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), width - paddingRight + 5, mousePos.y + 3);
+        }
+
+        // Top information bar
+        ctx.fillStyle = 'rgba(26, 26, 26, 0.95)';
+        ctx.fillRect(10, 2, width - 20, 18);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '8.5px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+
+        let timeStr = 'N/A';
+        if (c && c.time) {
+          const d = new Date(c.time * 1000);
+          if (!isNaN(d.getTime())) {
+            timeStr = d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+          }
+        }
+        ctx.fillText(`${timeStr} | O:`, 12, 14);
+        
+        ctx.fillStyle = '#fff';
+        let offset = 12 + ctx.measureText(`${timeStr} | O:`).width;
+        ctx.fillText(c.open.toFixed(2), offset, 14);
+
+        ctx.fillStyle = '#ffffff';
+        offset += ctx.measureText(c.open.toFixed(2)).width + 6;
+        ctx.fillText('H:', offset, 14);
+        
+        ctx.fillStyle = '#fff';
+        offset += ctx.measureText('H:').width;
+        ctx.fillText(c.high.toFixed(2), offset, 14);
+
+        ctx.fillStyle = '#ffffff';
+        offset += ctx.measureText(c.high.toFixed(2)).width + 6;
+        ctx.fillText('L:', offset, 14);
+        
+        ctx.fillStyle = '#fff';
+        offset += ctx.measureText('L:').width;
+        ctx.fillText(c.low.toFixed(2), offset, 14);
+
+        ctx.fillStyle = '#ffffff';
+        offset += ctx.measureText(c.low.toFixed(2)).width + 6;
+        ctx.fillText('C:', offset, 14);
+        
+        ctx.fillStyle = c.close >= c.open ? '#FFFFFF' : '#666666';
+        offset += ctx.measureText('C:').width;
+        ctx.fillText(c.close.toFixed(2), offset, 14);
+
+        ctx.fillStyle = '#ffffff';
+        offset += ctx.measureText(c.close.toFixed(2)).width + 6;
+        ctx.fillText('V:', offset, 14);
+        
+        ctx.fillStyle = '#fff';
+        offset += ctx.measureText('V:').width;
+        ctx.fillText(c.volume.toFixed(0), offset, 14);
+      } else {
+        // Default top HUD status
+        const latest = candleData[candleData.length - 1];
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '8px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`ASSET: ${symbol} | IND: SMA(9) [White] | SMA(21) [Orange] | PRICE: $${latest.close.toFixed(2)}`, 12, 14);
+      }
+    };
+
+    // Initialize resize observer
+    const resizeObserver = new ResizeObserver(() => {
+      handleResize();
+    });
+    if (containerRef.current) {
+      resizeObserver.observe(containerRef.current);
+    }
+
+    handleResize();
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [candleData, hoverIndex, mousePos, isHovering, symbol]);
+
+  const handleMouseMove = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !candleData || candleData.length === 0) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const paddingRight = 65;
+    const chartWidth = rect.width - paddingRight - 15;
+
+    const relX = x - 10;
+    const pct = relX / chartWidth;
+    let idx = Math.round(pct * (candleData.length - 1));
+    idx = Math.max(0, Math.min(candleData.length - 1, idx));
+
+    setHoverIndex(idx);
+    setMousePos({ x, y });
+    setIsHovering(true);
+  };
+
+  const handleMouseLeave = () => {
+    setIsHovering(false);
+    setHoverIndex(null);
+  };
+
+  return (
+    <div ref={containerRef} style={{ width: '100%', height: '100%', minHeight: '180px', position: 'relative' }}>
+      <canvas
+        ref={canvasRef}
+        style={{ width: '100%', height: '100%', display: 'block', background: 'transparent' }}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
+      />
+    </div>
+  );
+}
+
+// Markdown formatter for chat messages
+function formatChatMessage(text) {
+  if (!text) return "";
+  
+  // Basic markdown parser
+  let html = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+    
+  // Bold **text**
+  html = html.replace(/\*\*([\s\S]*?)\*\*/g, "<strong>$1</strong>");
+  
+  // Codeblocks ```javascript ... ```
+  html = html.replace(/```(?:[a-zA-Z]+)?([\s\S]*?)```/g, "<pre class='chat-code' style='background:rgba(0,0,0,0.3);padding:10px;border-radius:6px;overflow-x:auto;font-family:monospace;font-size:0.8rem;margin:8px 0;'><code>$1</code></pre>");
+  
+  // Inline code `code`
+  html = html.replace(/`([^`]+)`/g, "<code class='chat-inline-code' style='background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:4px;font-family:monospace;font-size:0.85rem;'>$1</code>");
+  
+  // Bullet points
+  html = html.replace(/^\s*[-*]\s+(.*)$/gm, "<li style='margin-left:16px;list-style-type:disc;'>$1</li>");
+  
+  // Linebreaks
+  html = html.replace(/\n/g, "<br />");
+  
+  return <div dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+// Typewriter effect for streaming chat text (Word-by-word, matching Antigravity's smooth flow)
+function TypewriterMessage({ content, onComplete, scrollContainerRef, chatAutoScroll }) {
+  const [displayedText, setDisplayedText] = useState("");
+  const wordsRef = useRef([]);
+  const indexRef = useRef(0);
+
+  // Sync scroll setting and callback to refs to prevent triggering useEffect rerun
+  const autoScrollRef = useRef(chatAutoScroll);
+  useEffect(() => {
+    autoScrollRef.current = chatAutoScroll;
+  }, [chatAutoScroll]);
+
+  const onCompleteRef = useRef(onComplete);
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
+
+  useEffect(() => {
+    // Convert newlines to individual tokens and split other text by space
+    const tokens = content
+      .split(" ")
+      .map(t => {
+        if (t.includes("\n")) {
+          return t.split(/(\n)/g);
+        }
+        return t;
+      })
+      .flat()
+      .filter(t => t !== "");
+
+    wordsRef.current = tokens;
+    indexRef.current = 0;
+    setDisplayedText("");
+    
+    const interval = setInterval(() => {
+      if (indexRef.current < wordsRef.current.length) {
+        // Grab 2 words at a time for a fast, organic reading speed
+        const nextWords = wordsRef.current.slice(indexRef.current, indexRef.current + 2);
+        indexRef.current += 2;
+        
+        setDisplayedText(prev => {
+          let updated = prev;
+          for (const token of nextWords) {
+            if (token === "\n") {
+              updated += "\n";
+            } else {
+              const lastChar = updated.slice(-1);
+              if (updated && lastChar !== "\n" && lastChar !== " ") {
+                updated += " ";
+              }
+              updated += token;
+            }
+          }
+          if (autoScrollRef.current && scrollContainerRef && scrollContainerRef.current) {
+            scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+          }
+          return updated;
+        });
+      } else {
+        clearInterval(interval);
+        if (onCompleteRef.current) onCompleteRef.current();
+      }
+    }, 45); // Comfortable pacing for reading
+
+    return () => clearInterval(interval);
+  }, [content]); // Only rerun when the actual message content changes
+
+  return formatChatMessage(displayedText);
+}
+
+const thinkingStages = [
+  "Initializing Aether Brain context...",
+  "Retrieving live technical indicators (RSI, SMA, ADX)...",
+  "Analyzing market structure and volume regimes...",
+  "Evaluating active portfolio positioning and stop-losses...",
+  "Consulting active strategy guidelines (.md guidelines)...",
+  "Synthesizing logical reasoning and trading actions...",
+  "Finalizing reply..."
+];
+
+function JarvisCore({ animating }) {
+  const strokeColor = '#FFFFFF';
+  
+  return (
+    <div className="jarvis-hud-container background-watermark" style={{
+      position: 'absolute',
+      top: '335px',
+      left: '50%',
+      transform: 'translate(-50%, -50%)',
+      width: 'min(80vw, 80vh)',
+      height: 'min(80vw, 80vh)',
+      maxWidth: '850px',
+      maxHeight: '850px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      pointerEvents: 'none',
+      zIndex: 100,
+      opacity: 0.02,
+      background: 'none'
+    }}>
+      <svg className="jarvis-core-svg" viewBox="0 0 100 100" style={{ width: '100%', height: '100%', overflow: 'visible' }}>
+        {animating && (
+          <>
+            <circle cx="50" cy="50" r="44" fill="none" stroke={strokeColor} strokeWidth="0.5" className="jarvis-ripple-ring" style={{ animationDelay: '0s' }} />
+            <circle cx="50" cy="50" r="44" fill="none" stroke={strokeColor} strokeWidth="0.5" className="jarvis-ripple-ring" style={{ animationDelay: '0.6s' }} />
+            <circle cx="50" cy="50" r="44" fill="none" stroke={strokeColor} strokeWidth="0.5" className="jarvis-ripple-ring" style={{ animationDelay: '1.2s' }} />
+          </>
+        )}
+        <circle
+          cx="50"
+          cy="50"
+          r="38"
+          fill="none"
+          stroke={strokeColor}
+          strokeWidth="0.8"
+          strokeDasharray="6 4"
+          className="jarvis-spin-clockwise"
+        />
+        <circle
+          cx="50"
+          cy="50"
+          r="30"
+          fill="none"
+          stroke={strokeColor}
+          strokeWidth="0.6"
+          strokeDasharray="20 10 5 10"
+          className="jarvis-spin-counter"
+          opacity="0.8"
+        />
+        <circle cx="50" cy="50" r="22" fill="none" stroke={strokeColor} strokeWidth="0.4" opacity="0.5" />
+        <circle cx="50" cy="50" r="14" fill="none" stroke={strokeColor} strokeWidth="0.4" opacity="0.3" />
+        <circle
+          cx="50"
+          cy="50"
+          r="6"
+          fill="none"
+          stroke={strokeColor}
+          strokeWidth="0.8"
+          className="jarvis-core-center"
+        />
+        {/* Aether CPU Logo in the center */}
+        <g stroke={strokeColor} strokeWidth="0.4" fill="none" opacity="0.9" className="jarvis-core-center">
+          {/* Main CPU body */}
+          <rect x="46.5" y="46.5" width="7" height="7" rx="1" ry="1" />
+          {/* Inner core */}
+          <rect x="48.5" y="48.5" width="3" height="3" />
+          {/* Top pins */}
+          <line x1="48.5" y1="44.5" x2="48.5" y2="46.5" />
+          <line x1="50" y1="44.5" x2="50" y2="46.5" />
+          <line x1="51.5" y1="44.5" x2="51.5" y2="46.5" />
+          {/* Bottom pins */}
+          <line x1="48.5" y1="53.5" x2="48.5" y2="55.5" />
+          <line x1="50" y1="53.5" x2="50" y2="55.5" />
+          <line x1="51.5" y1="53.5" x2="51.5" y2="55.5" />
+          {/* Left pins */}
+          <line x1="44.5" y1="48.5" x2="46.5" y2="48.5" />
+          <line x1="44.5" y1="50" x2="46.5" y2="50" />
+          <line x1="44.5" y1="51.5" x2="46.5" y2="51.5" />
+          {/* Right pins */}
+          <line x1="53.5" y1="48.5" x2="55.5" y2="48.5" />
+          <line x1="53.5" y1="50" x2="55.5" y2="50" />
+          <line x1="53.5" y1="51.5" x2="55.5" y2="51.5" />
+        </g>
+      </svg>
+    </div>
+  );
+}
+
+function CognitiveAnalysis({ status }) {
+  const latestDecision = status?.latestDecision;
+  
+  if (!latestDecision) {
+    return (
+      <div className="term-panel horizontal-analysis" style={{ height: '54px', display: 'flex', flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
+        <Activity size={18} style={{ color: 'var(--color-text-dark)' }} />
+        <span style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+          Awaiting Cognitive Input...
+        </span>
+      </div>
+    );
+  }
+
+  const { decision, confidence, amount_pct, timestamp, indicators } = latestDecision;
+  const confidencePct = confidence ? (confidence * 100).toFixed(0) : '0';
+  const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'N/A';
+
+  // Get decision color
+  let decisionColor = '#a1a1aa';
+  if (decision === 'BUY') decisionColor = 'var(--color-success)';
+  if (decision === 'SELL') decisionColor = 'var(--color-danger)';
+
+  return (
+    <div className="term-panel horizontal-analysis" style={{ height: '54px', display: 'flex', flexDirection: 'row', gap: '16px', flexShrink: 0, padding: '6px 12px', alignItems: 'center', justifyContent: 'space-between' }}>
+      
+      {/* Title block */}
+      <div style={{ display: 'flex', flexDirection: 'row', gap: '8px', alignItems: 'center', borderRight: '1px solid rgba(255, 255, 255, 0.05)', paddingRight: '16px', flexShrink: 0 }}>
+        <Cpu size={15} style={{ color: 'var(--color-primary)', flexShrink: 0 }} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
+          <span style={{ fontSize: '0.75rem', fontWeight: 'bold', letterSpacing: '0.5px' }}>COGNITIVE OPERATIONS</span>
+          <span style={{ fontSize: '0.55rem', color: 'var(--color-text-muted)' }}>SYNC: {timeStr}</span>
+        </div>
+      </div>
+
+      {/* Metrics Row */}
+      <div style={{ display: 'flex', gap: '12px', flex: 1, justifyContent: 'space-around', alignItems: 'center' }}>
+        {/* Decision */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>AI Decision</span>
+          <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: decisionColor }}>
+            {decision || 'HOLD'}
+          </span>
+        </div>
+        
+        {/* Confidence */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Confidence</span>
+          <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: '#fff' }}>
+            {confidencePct}%
+          </span>
+        </div>
+
+        {/* Allocation */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Allocation</span>
+          <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: 'var(--color-primary)' }}>
+            {amount_pct || 0}%
+          </span>
+        </div>
+
+        {/* Market Regime */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Market Regime</span>
+          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
+            {indicators?.marketRegime ? indicators.marketRegime.replace(/_/g, ' ') : 'N/A'}
+          </span>
+        </div>
+
+        {/* ADX */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>ADX</span>
+          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
+            {indicators?.adx !== undefined && indicators?.adx !== null ? indicators.adx.toFixed(1) : 'N/A'}
+          </span>
+        </div>
+
+        {/* RVol */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>RVol</span>
+          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
+            {indicators?.rvol !== undefined && indicators?.rvol !== null ? `${indicators.rvol.toFixed(1)}x` : 'N/A'}
+          </span>
+        </div>
+
+        {/* Bot Status (Running/Idle) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', paddingLeft: '12px', borderLeft: '1px solid rgba(255, 255, 255, 0.08)' }}>
+          <span style={{
+            width: '6px',
+            height: '6px',
+            borderRadius: '50%',
+            backgroundColor: status?.isBotRunning ? 'var(--color-success)' : 'var(--color-danger)',
+            boxShadow: status?.isBotRunning ? '0 0 6px var(--color-success)' : '0 0 6px var(--color-danger)',
+            display: 'inline-block'
+          }} />
+          <span style={{ fontSize: '0.75rem', fontWeight: 'bold', letterSpacing: '0.3px', color: status?.isBotRunning ? 'var(--color-success)' : 'var(--color-danger)' }}>
+            BOT: {status?.isBotRunning ? 'RUNNING' : 'IDLE'}
+          </span>
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
 export default function App() {
+  const [isNavExpanded, setIsNavExpanded] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [dashboardSubTab, setDashboardSubTab] = useState('portfolio');
   const [terminalSubTab, setTerminalSubTab] = useState('chart');
@@ -300,10 +924,28 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [candleData, setCandleData] = useState([]);
   const [chartLoading, setChartLoading] = useState(false);
+
+  // AI Chat State
+  const [chatMessages, setChatMessages] = useState([
+    { role: 'assistant', content: 'Hello! I am Aether AI. How can I help you manage your portfolio or analyze the market today?' }
+  ]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatToolLogs, setChatToolLogs] = useState([]);
+
+  // Custom Plugins & Strategies State
+  const [customTools, setCustomTools] = useState([]);
+  const [strategies, setStrategies] = useState([]);
   
   // Settings Form State
   const [settingsForm, setSettingsForm] = useState({
     geminiApiKey: '',
+    openaiApiKey: '',
+    claudeApiKey: '',
+    activeLlmProvider: 'gemini',
+    activeLlmModel: 'gemini-2.5-flash',
+    enabledTools: [],
+    enabledStrategies: [],
     selectedAsset: 'BTC/USD',
     selectedTimeframe: '1h',
     tradingMode: 'paper',
@@ -324,15 +966,17 @@ export default function App() {
     smtpPort: '465',
     smtpUser: '',
     smtpPass: '',
+    discordWebhookUrl: '',
     multiTimeframeEnabled: false,
     macroTimeframe: '1d',
-    trailingStopEnabled: false,
-    trailingStopPct: 2.5,
+    trailingStopEnabled: true,
+    trailingStopPct: 4.0,
     takeProfitEnabled: false,
     takeProfitPct: 10.0,
-    atrStopEnabled: false,
+    atrStopEnabled: true,
     atrStopMultiplier: 2.0,
-    newsSentimentEnabled: false
+    newsSentimentEnabled: false,
+    maxPositionAllocationPct: 75
   });
 
   // Manual trade form state
@@ -354,33 +998,70 @@ export default function App() {
   const [backtestRunning, setBacktestRunning] = useState(false);
   const [backtestResults, setBacktestResults] = useState(null);
   const [backtestError, setBacktestError] = useState('');
+  const [multiIndicators, setMultiIndicators] = useState(null);
 
   // UI Refs
   const chartContainerRef = useRef(null);
   const btChartContainerRef = useRef(null);
+  const chatScrollRef = useRef(null);
+  const chatInputRef = useRef(null);
+  const [thinkingStep, setThinkingStep] = useState(0);
+  const [chatAutoScroll, setChatAutoScroll] = useState(true);
+
+  const handleChatScroll = (e) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.target;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 25;
+    setChatAutoScroll(isAtBottom);
+  };
 
   // Fetch bot status, logs, and trades
   const fetchData = async () => {
     try {
-      const [statusRes, logsRes, tradesRes] = await Promise.all([
+      const [statusRes, logsRes, tradesRes, multiIndicatorsRes] = await Promise.all([
         fetch(`${BACKEND_URL}/api/status`),
         fetch(`${BACKEND_URL}/api/logs`),
-        fetch(`${BACKEND_URL}/api/trades`)
+        fetch(`${BACKEND_URL}/api/trades`),
+        fetch(`${BACKEND_URL}/api/market/multi-indicators`).catch(e => {
+          console.warn("Could not load multi timeframe indicators:", e.message);
+          return null;
+        })
       ]);
 
       const statusData = await statusRes.json();
       const logsData = await logsRes.json();
       const tradesData = await tradesRes.json();
+      let multiIndData = null;
+      if (multiIndicatorsRes) {
+        try {
+          multiIndData = await multiIndicatorsRes.json();
+        } catch (e) {
+          console.warn("Error parsing multi-timeframe indicators json:", e);
+        }
+      }
 
       setStatus(statusData);
       setLogs(logsData);
       setTrades(tradesData);
+      if (multiIndData && !multiIndData.error) {
+        setMultiIndicators(multiIndData);
+      }
       
       // Sync settings form once on initial load
       if (loading) {
         setSettingsForm(statusData.settings);
         setManualTrade(prev => ({ ...prev, symbol: statusData.settings.selectedAsset }));
         setBacktestConfig(prev => ({ ...prev, symbol: statusData.settings.selectedAsset, timeframe: statusData.settings.selectedTimeframe }));
+        
+        try {
+          const chatRes = await fetch(`${BACKEND_URL}/api/chat/history`);
+          const chatData = await chatRes.json();
+          if (Array.isArray(chatData)) {
+            setChatMessages(chatData);
+          }
+        } catch (chatErr) {
+          console.error("Error fetching chat history:", chatErr);
+        }
+        
         setLoading(false);
       }
     } catch (err) {
@@ -395,13 +1076,58 @@ export default function App() {
     return () => clearInterval(interval);
   }, [loading]);
 
-  // Scroll to bottom of logs internally when logs update or tab changes
+  // Thinking steps progression timer
+  useEffect(() => {
+    if (!chatLoading) {
+      setThinkingStep(0);
+      return;
+    }
+
+    const interval = setInterval(() => {
+      setThinkingStep(prev => {
+        if (prev < 6) return prev + 1;
+        return prev;
+      });
+    }, 1200);
+
+    return () => clearInterval(interval);
+  }, [chatLoading]);
+
+  // Auto-scroll chat console to bottom on update if enabled
+  useEffect(() => {
+    if (chatAutoScroll && chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatMessages.length, chatLoading, chatAutoScroll]);
+
+  const handleTypewriterComplete = (index) => {
+    setChatMessages(prev => {
+      const next = [...prev];
+      if (next[index]) {
+        next[index] = { ...next[index], isNew: false };
+      }
+      return next;
+    });
+  };
+
+  // Scroll to bottom of logs on tab changes
   useEffect(() => {
     const terminals = document.querySelectorAll('.log-terminal');
     terminals.forEach(term => {
       term.scrollTop = term.scrollHeight;
     });
-  }, [logs, activeTab, dashboardSubTab]);
+  }, [activeTab, dashboardSubTab]);
+
+  // Handle auto-scroll on new logs only if already near bottom
+  useEffect(() => {
+    const terminals = document.querySelectorAll('.log-terminal');
+    terminals.forEach(term => {
+      const isNearBottom = term.scrollHeight - term.scrollTop - term.clientHeight <= 50;
+      if (isNearBottom) {
+        term.scrollTop = term.scrollHeight;
+      }
+    });
+  }, [logs]);
 
   // Fetch latest price data for manual trade calculations
   useEffect(() => {
@@ -411,7 +1137,7 @@ export default function App() {
     const loadPriceData = async () => {
       setChartLoading(true);
       try {
-        const res = await fetch(`${BACKEND_URL}/api/market/candles?symbol=${status.settings.selectedAsset}&timeframe=${status.settings.selectedTimeframe}&limit=120`);
+        const res = await fetch(`${BACKEND_URL}/api/market/candles?symbol=${status.settings.selectedAsset}&timeframe=${status.settings.selectedTimeframe}&limit=200`);
         const data = await res.json();
         
         if (!isMounted) return;
@@ -533,6 +1259,185 @@ export default function App() {
       fetchManual();
     }
   }, [activeTab]);
+
+  // Fetch tools and strategies list from backend
+  const fetchPlugins = async () => {
+    try {
+      const [toolsRes, strategiesRes] = await Promise.all([
+        fetch(`${BACKEND_URL}/api/tools`),
+        fetch(`${BACKEND_URL}/api/strategies`)
+      ]);
+      const toolsData = await toolsRes.json();
+      const strategiesData = await strategiesRes.json();
+      setCustomTools(toolsData);
+      setStrategies(strategiesData);
+    } catch (err) {
+      console.error("Error fetching plugins:", err);
+    }
+  };
+
+  // Sync plugins when settings or chat tabs open
+  useEffect(() => {
+    if (activeTab === 'settings') {
+      fetchPlugins();
+    }
+  }, [activeTab]);
+
+  // Plugins API Handlers
+  const handleToggleTool = async (filename) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/tools/${filename}/toggle`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        fetchPlugins();
+        fetchData();
+      }
+    } catch (err) {
+      console.error("Error toggling tool:", err);
+    }
+  };
+
+  const handleDeleteTool = async (filename) => {
+    if (!confirm(`Are you sure you want to delete tool '${filename}'?`)) return;
+    try {
+      await fetch(`${BACKEND_URL}/api/tools/${filename}`, { method: 'DELETE' });
+      fetchPlugins();
+      fetchData();
+    } catch (err) {
+      console.error("Error deleting tool:", err);
+    }
+  };
+
+  const handleUploadTool = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      const code = evt.target.result;
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/tools/upload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: file.name, code })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert("Tool uploaded and compiled successfully!");
+          fetchPlugins();
+          fetchData();
+        } else {
+          alert(`Upload failed: ${data.error}`);
+        }
+      } catch (err) {
+        alert(`Upload error: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleToggleStrategy = async (filename) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/strategies/${filename}/toggle`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        fetchPlugins();
+        fetchData();
+      }
+    } catch (err) {
+      console.error("Error toggling strategy:", err);
+    }
+  };
+
+  const handleDeleteStrategy = async (filename) => {
+    if (!confirm(`Are you sure you want to delete strategy guideline '${filename}'?`)) return;
+    try {
+      await fetch(`${BACKEND_URL}/api/strategies/${filename}`, { method: 'DELETE' });
+      fetchPlugins();
+      fetchData();
+    } catch (err) {
+      console.error("Error deleting strategy:", err);
+    }
+  };
+
+  const handleUploadStrategy = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      const content = evt.target.result;
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/strategies/upload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: file.name, content })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert("Strategy guideline uploaded successfully!");
+          fetchPlugins();
+          fetchData();
+        } else {
+          alert(`Upload failed: ${data.error}`);
+        }
+      } catch (err) {
+        alert(`Upload error: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Chat Submission Handler
+  const handleSendChatMessage = async (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || chatLoading) return;
+
+    const userMsg = { role: 'user', content: chatInput };
+    const newMessages = [...chatMessages, userMsg];
+    setChatMessages(newMessages);
+    setChatInput('');
+    setChatLoading(true);
+    setChatToolLogs([]);
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: newMessages })
+      });
+      const data = await res.json();
+      if (data.error) {
+        setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${data.error}`, isNew: true }]);
+      } else {
+        setChatMessages(prev => [...prev, { role: 'assistant', content: data.response, isNew: true }]);
+        if (data.toolLogs && data.toolLogs.length > 0) {
+          setChatToolLogs(data.toolLogs);
+        }
+      }
+    } catch (err) {
+      setChatMessages(prev => [...prev, { role: 'assistant', content: `Network error: ${err.message}`, isNew: true }]);
+    } finally {
+      setChatLoading(false);
+      setTimeout(() => {
+        chatInputRef.current?.focus();
+      }, 50);
+    }
+  };
+
+  // Clear Chat History Handler
+  const handleClearChat = async () => {
+    if (!window.confirm("Are you sure you want to clear the chat history?")) return;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/chat/clear`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setChatMessages([]);
+      }
+    } catch (err) {
+      console.error("Failed to clear chat history:", err);
+    }
+  };
 
   // API Call: Save settings
   const handleSaveSettings = async (e) => {
@@ -682,467 +1587,828 @@ export default function App() {
   const peakPrice = status?.highestPriceReached?.[assetName] || holdingsInfo.avgEntryPrice || 0;
 
   return (
-    <div className="app-container">
+    <div className={`app-container ${isNavExpanded ? 'nav-expanded' : 'nav-collapsed'}`}>
       
-      {/* HEADER SECTION */}
-      <header className="app-header">
-        <div className="brand-section">
+      {/* SIDEBAR NAVIGATION */}
+      <aside className={`side-nav ${isNavExpanded ? 'expanded' : 'collapsed'}`}>
+        <div className="side-nav-brand">
           <div className="brand-icon">
-            <Cpu size={28} />
+            <img src="/favicon.svg" alt="Aether Logo" style={{ width: '24px', height: '24px', display: 'block' }} />
           </div>
-          <div>
-            <h1 className="brand-title">AETHER AI</h1>
-            <p style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', letterSpacing: '0.5px' }}>CRYPTOCURRENCY ALGORITHMIC BOT</p>
-          </div>
+          {isNavExpanded && (
+            <div className="brand-details">
+              <h1 className="brand-title">AETHER AI</h1>
+              <p className="brand-subtitle">CRYPTOCURRENCY ALGORITHMIC BOT</p>
+            </div>
+          )}
         </div>
 
         {/* Navigation */}
-        <nav className="nav-tabs">
-          <button className={`tab-btn ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>
-            <TrendingUp size={16} /> Dashboard
+        <nav className="side-nav-links">
+          <button className={`side-nav-btn ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')} title="Dashboard">
+            <TrendingUp size={16} />
+            {isNavExpanded && <span>Dashboard</span>}
           </button>
-          <button className={`tab-btn ${activeTab === 'terminal' ? 'active' : ''}`} onClick={() => setActiveTab('terminal')}>
-            <Activity size={16} /> Live Terminal
+          <button className={`side-nav-btn ${activeTab === 'terminal' ? 'active' : ''}`} onClick={() => setActiveTab('terminal')} title="Live Terminal">
+            <Activity size={16} />
+            {isNavExpanded && <span>Live Terminal</span>}
           </button>
-          <button className={`tab-btn ${activeTab === 'backtest' ? 'active' : ''}`} onClick={() => setActiveTab('backtest')}>
-            <History size={16} /> Backtester
+          <button className={`side-nav-btn ${activeTab === 'backtest' ? 'active' : ''}`} onClick={() => setActiveTab('backtest')} title="Backtester">
+            <History size={16} />
+            {isNavExpanded && <span>Backtester</span>}
           </button>
-          <button className={`tab-btn ${activeTab === 'logs' ? 'active' : ''}`} onClick={() => setActiveTab('logs')}>
-            <TermIcon size={16} /> Brain Logs
+          <button className={`side-nav-btn ${activeTab === 'logs' ? 'active' : ''}`} onClick={() => setActiveTab('logs')} title="Brain Logs">
+            <TermIcon size={16} />
+            {isNavExpanded && <span>Brain Logs</span>}
           </button>
-          <button className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>
-            <SettingsIcon size={16} /> Settings
+
+          <button className={`side-nav-btn ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')} title="Settings">
+            <SettingsIcon size={16} />
+            {isNavExpanded && <span>Settings</span>}
           </button>
-          <button className={`tab-btn ${activeTab === 'manual' ? 'active' : ''}`} onClick={() => setActiveTab('manual')}>
-            <HelpCircle size={16} /> System Manual
+          <button className={`side-nav-btn ${activeTab === 'manual' ? 'active' : ''}`} onClick={() => setActiveTab('manual')} title="System Manual">
+            <HelpCircle size={16} />
+            {isNavExpanded && <span>System Manual</span>}
           </button>
         </nav>
 
-        {/* Status indicator */}
-        <div className="bot-status-badge">
-          <span className={`status-dot ${status?.isBotRunning ? 'active' : ''}`}></span>
-          <span>BOT: {status?.isBotRunning ? 'RUNNING' : 'IDLE'}</span>
-        </div>
-      </header>
-
-      {/* DASHBOARD TAB */}
-      {activeTab === 'dashboard' && (
-        <div className={`dashboard-grid fade-in show-subtab-${dashboardSubTab}`}>
-          {/* Mobile-only Sub-navigation Bar */}
-          <div className="mobile-subtabs-bar">
-            <button 
-              className={`mobile-subtab-btn ${dashboardSubTab === 'portfolio' ? 'active' : ''}`}
-              onClick={() => setDashboardSubTab('portfolio')}
-            >
-              Portfolio & Positions
-            </button>
-            <button 
-              className={`mobile-subtab-btn ${dashboardSubTab === 'logs' ? 'active' : ''}`}
-              onClick={() => setDashboardSubTab('logs')}
-            >
-              Operations & Fills
-            </button>
-          </div>
-
-          {/* Left Column: Account info & controls */}
-          <aside className="dashboard-sidebar">
-            <div className="glass-panel">
-              <div className="panel-header">
-                <span className="panel-title"><Layers size={16} /> Valuation</span>
-                {status?.settings?.tradingMode === 'live' ? (
-                  <span style={{ fontSize: '0.65rem', background: 'rgba(239, 68, 68, 0.15)', color: 'var(--color-danger)', padding: '2px 8px', borderRadius: '4px', fontWeight: 'bold', border: '1px solid rgba(239, 68, 68, 0.25)' }}>LIVE</span>
-                ) : (
-                  <span style={{ fontSize: '0.65rem', background: 'rgba(59, 130, 246, 0.1)', color: 'var(--color-secondary)', padding: '2px 8px', borderRadius: '4px', fontWeight: 'bold' }}>PAPER</span>
-                )}
+        {/* Status indicator / Footer */}
+        <div className="side-nav-footer">
+          {isNavExpanded ? (
+            <div className="side-nav-bot-ops" style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '6px',
+              padding: '8px 10px',
+              background: 'rgba(255, 255, 255, 0.02)',
+              border: '1px solid rgba(255, 255, 255, 0.05)',
+              borderRadius: '6px',
+              width: '100%'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.7rem', fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--color-secondary)', letterSpacing: '0.5px' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  Bot Operations
+                  <span style={{
+                    width: '6px',
+                    height: '6px',
+                    borderRadius: '50%',
+                    backgroundColor: status?.isBotRunning ? 'var(--color-success)' : 'var(--color-danger)',
+                    boxShadow: status?.isBotRunning ? '0 0 6px var(--color-success)' : '0 0 6px var(--color-danger)',
+                    display: 'inline-block'
+                  }} />
+                </span>
               </div>
-              
-              <div className="balance-section">
-                <p className="balance-label">Total Portfolio Net Worth</p>
-                <h2 className="balance-value">${totalPortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</h2>
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <div className="stat-row">
-                  <span className="stat-label">Available USD Cash</span>
-                  <span className="stat-val">${status?.portfolio?.balanceUSD?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                </div>
-                <div className="stat-row">
-                  <span className="stat-label">Holdings Valuation</span>
-                  <span className="stat-val">${holdingsValuation.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                </div>
-                <div className="stat-row">
-                  <span className="stat-label">Trading Asset</span>
-                  <span className="stat-val" style={{ color: 'var(--color-secondary)' }}>{status?.settings?.selectedAsset}</span>
-                </div>
-              </div>
-
-              <div style={{ display: 'flex', gap: '10px', marginTop: '8px' }}>
+              <div style={{ display: 'flex', gap: '6px', width: '100%' }}>
                 {status?.isBotRunning ? (
-                  <button className="btn btn-danger" style={{ flex: 1 }} onClick={() => handleToggleBot(false)}>
-                    <Square size={16} /> Pause Bot
+                  <button 
+                    className="btn btn-danger" 
+                    style={{ flex: 1, padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }} 
+                    onClick={() => handleToggleBot(false)} 
+                    type="button"
+                  >
+                    <Pause size={11} /> Pause Bot
                   </button>
                 ) : (
-                  <button className="btn btn-success" style={{ flex: 1 }} onClick={() => handleToggleBot(true)}>
-                    <Play size={16} /> Start Bot
+                  <button 
+                    className="btn btn-success" 
+                    style={{ flex: 1, padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }} 
+                    onClick={() => handleToggleBot(true)} 
+                    type="button"
+                  >
+                    <Play size={11} /> Start Bot
                   </button>
                 )}
-                <button className="btn btn-secondary" onClick={handleResetPortfolio} title="Reset portfolio balance">
-                  <RefreshCw size={16} />
+                <button 
+                  className="btn btn-secondary" 
+                  style={{ padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} 
+                  onClick={handleResetPortfolio} 
+                  type="button"
+                >
+                  Reset
                 </button>
               </div>
             </div>
-
-            {/* Position display */}
-            <div className="glass-panel">
-              <div className="panel-header">
-                <span className="panel-title"><Database size={16} /> Active Positions</span>
-              </div>
-              {holdingsInfo.amount > 0 ? (
-                <div className="position-card">
-                  <div className="position-header">
-                    <span>{assetName} Long</span>
-                    <span style={{ color: 'var(--color-success)' }}>Open</span>
-                  </div>
-                  <div className="position-body">
-                    <div>
-                      <p className="text-muted">Size</p>
-                      <p style={{ color: '#fff', fontWeight: 'bold' }}>{holdingsInfo.amount.toFixed(6)}</p>
-                    </div>
-                    <div>
-                      <p className="text-muted">Entry Price</p>
-                      <p style={{ color: '#fff', fontWeight: 'bold' }}>${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</p>
-                    </div>
-                    <div style={{ gridColumn: 'span 2', marginTop: '6px', borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '6px' }}>
-                      <p className="text-muted">Estimated P&L</p>
-                      <p style={{ 
-                        fontWeight: 'bold', 
-                        fontSize: '0.9rem',
-                        color: currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--color-success)' : 'var(--color-danger)'
-                      }}>
-                        {currentAssetPrice >= holdingsInfo.avgEntryPrice ? '+' : ''}
-                        {((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount).toLocaleString(undefined, { style: 'currency', currency: 'USD' })}
-                        {' '}({(((currentAssetPrice - holdingsInfo.avgEntryPrice) / holdingsInfo.avgEntryPrice) * 100).toFixed(2)}%)
-                      </p>
-                    </div>
-                  </div>
-                </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center', width: '100%' }}>
+              {status?.isBotRunning ? (
+                <button 
+                  className="btn btn-danger" 
+                  style={{ width: '36px', height: '36px', borderRadius: '50%', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid rgba(248, 113, 113, 0.4)', boxShadow: '0 0 8px rgba(248, 113, 113, 0.2)' }}
+                  onClick={() => handleToggleBot(false)} 
+                  type="button"
+                  title="Pause Bot"
+                >
+                  <Pause size={14} />
+                </button>
               ) : (
-                <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--color-text-dark)', fontSize: '0.8rem' }}>
-                  No open positions. Cash is 100% liquid.
-                </div>
+                <button 
+                  className="btn btn-success" 
+                  style={{ width: '36px', height: '36px', borderRadius: '50%', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid rgba(74, 222, 128, 0.4)', boxShadow: '0 0 8px rgba(74, 222, 128, 0.2)' }}
+                  onClick={() => handleToggleBot(true)} 
+                  type="button"
+                  title="Start Bot"
+                >
+                  <Play size={14} style={{ marginLeft: '1px' }} />
+                </button>
               )}
             </div>
+          )}
 
-            {/* Recent Trade Fills in Sidebar */}
-            <div className="glass-panel" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <div className="panel-header">
-                <span className="panel-title"><History size={16} /> Recent Trade Fills</span>
-              </div>
-              <div className="trades-list" style={{ flex: 1, minHeight: 0, maxHeight: 'none' }}>
-                {trades.length > 0 ? (
-                  trades.map((t, idx) => (
-                    <div className="trade-item" key={idx}>
-                      <div className="trade-item-left">
-                        <span className={`trade-badge ${t.action.toLowerCase()}`}>{t.action}</span>
-                        <span style={{ fontWeight: '600' }}>{t.symbol}</span>
-                      </div>
-                      <div className="trade-item-right">
-                        <span>{(t.amount || 0).toFixed(6)} @ ${(t.price || 0).toLocaleString()}</span>
-                        <span className="text-muted">Fee: ${(t.fee || 0).toFixed(2)} | Balance: ${(t.balanceAfter || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div style={{ textAlign: 'center', padding: '16px 0', color: 'var(--color-text-dark)', fontSize: '0.8rem' }}>
-                    No trade executions recorded yet.
-                  </div>
-                )}
-              </div>
-            </div>
-          </aside>
+          <button className="side-nav-toggle" onClick={() => setIsNavExpanded(!isNavExpanded)} title={isNavExpanded ? "Collapse Menu" : "Expand Menu"}>
+            {isNavExpanded ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+          </button>
+        </div>
+      </aside>
 
-          {/* Right Column: Execution logs & stats */}
-          <main className="dashboard-main">
-            {status?.latestDecision && (
-              <div className="glass-panel ai-diagnostic-panel">
-                <div className="panel-header">
-                  <span className="panel-title" style={{ color: 'var(--color-warning)', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <Cpu size={16} /> Aether AI Diagnostic Panel
-                  </span>
-                  <span style={{ fontSize: '0.65rem', color: 'var(--color-text-dark)' }}>
-                    Last Run: {status.latestDecision.timestamp ? new Date(status.latestDecision.timestamp).toLocaleTimeString() : 'N/A'}
-                  </span>
+      <div className="main-viewport" style={{ position: 'relative' }}>
+      {activeTab === 'dashboard' && (
+        <div className="aether-dashboard-wrapper fade-in">
+          <CognitiveAnalysis status={status} />
+          <div className="aether-terminal-cols">
+            {/* Left Column: Account & Operations Control */}
+            <div className="terminal-col-left">
+              {/* Valuation Dashboard */}
+              <div className="term-panel" style={{ height: '160px', minHeight: '160px', maxHeight: '160px', display: 'flex', flexDirection: 'column' }}>
+                <div className="term-panel-header">
+                  <span>Valuation Dashboard</span>
                 </div>
-                
-                <div className="diagnostic-summary-grid">
-                  <div className="diag-stat-card">
-                    <span className="diag-label">Market Cycle / Structure</span>
-                    <span className="diag-val" style={{ color: '#fff', fontSize: '0.85rem', fontWeight: 'bold' }}>
-                      {status.latestDecision.market_structure || 'N/A'}
+                <div className="wallet-box" style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 12px', justifyContent: 'center' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column' }}>
+                    <span className="text-muted" style={{ textTransform: 'uppercase', fontSize: '0.62rem', letterSpacing: '0.5px' }}>Total Net Worth</span>
+                    <span className="wallet-net-worth" style={{ fontSize: '1.25rem', marginTop: '1px' }}>
+                      ${totalPortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </span>
                   </div>
-
-                  <div className="diag-stat-card">
-                    <span className="diag-label">AI Confidence</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
-                      <span className="diag-val" style={{ color: 'var(--color-success)', fontWeight: 'bold' }}>
-                        {status.latestDecision.confidence ? (status.latestDecision.confidence * 100).toFixed(0) : '0'}%
-                      </span>
-                      <div className="diag-progress-bg">
-                        <div 
-                          className="diag-progress-bar" 
-                          style={{ 
-                            width: `${status.latestDecision.confidence ? (status.latestDecision.confidence * 100) : 0}%`,
-                            backgroundColor: 'var(--color-success)'
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="diag-stat-card">
-                    <span className="diag-label">News Sentiment Score</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
-                      <span 
-                        className="diag-val" 
-                        style={{ 
-                          color: (status.latestDecision.news_sentiment_score || 0) > 0 
-                            ? 'var(--color-success)' 
-                            : (status.latestDecision.news_sentiment_score || 0) < 0 
-                              ? 'var(--color-danger)' 
-                              : 'var(--color-text-muted)',
-                          fontWeight: 'bold'
-                        }}
-                      >
-                        {(status.latestDecision.news_sentiment_score || 0) > 0 ? '+' : ''}
-                        {status.latestDecision.news_sentiment_score || 0}/10
-                      </span>
-                      <div className="diag-progress-bg" style={{ position: 'relative' }}>
-                        <div 
-                          className="diag-progress-bar" 
-                          style={{ 
-                            width: `${Math.abs(status.latestDecision.news_sentiment_score || 0) * 10}%`,
-                            left: (status.latestDecision.news_sentiment_score || 0) >= 0 ? '50%' : 'auto',
-                            right: (status.latestDecision.news_sentiment_score || 0) < 0 ? '50%' : 'auto',
-                            position: 'absolute',
-                            backgroundColor: (status.latestDecision.news_sentiment_score || 0) >= 0 ? 'var(--color-success)' : 'var(--color-danger)'
-                          }}
-                        />
-                        <div style={{ position: 'absolute', left: '50%', top: 0, width: '1px', height: '100%', background: 'rgba(255,255,255,0.2)' }} />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="diag-stat-card">
-                    <span className="diag-label">Key Trade Zones</span>
-                    <div style={{ display: 'flex', gap: '10px', marginTop: '4px', fontSize: '0.75rem' }}>
-                      <span style={{ color: 'var(--color-success)', background: 'rgba(16, 185, 129, 0.08)', padding: '2px 6px', borderRadius: '4px', border: '1px solid rgba(16, 185, 129, 0.15)' }}>
-                        Floor: ${status.latestDecision.support_level ? status.latestDecision.support_level.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '0.00'}
-                      </span>
-                      <span style={{ color: 'var(--color-danger)', background: 'rgba(239, 68, 68, 0.08)', padding: '2px 6px', borderRadius: '4px', border: '1px solid rgba(239, 68, 68, 0.15)' }}>
-                        Ceiling: ${status.latestDecision.resistance_level ? status.latestDecision.resistance_level.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '0.00'}
+                  <div style={{ borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: '5px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                      <span className="text-muted">Cash (USD)</span>
+                      <span style={{ fontWeight: '600', color: '#fff' }}>
+                        ${(status?.portfolio?.balanceUSD || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </span>
                     </div>
-                  </div>
-
-                  <div className="diag-stat-card">
-                    <span className="diag-label">Risk-to-Reward Ratio</span>
-                    <span className="diag-val" style={{ color: 'var(--color-secondary)', fontWeight: 'bold' }}>
-                      {status.latestDecision.risk_reward_ratio || '1:1'} R:R
-                    </span>
-                  </div>
-                </div>
-
-                <div className="diagnostic-rationale-box">
-                  <span className="diag-label">AI Rationale & Wave Strategy</span>
-                  <p className="diagnostic-rationale-text">
-                    "{status.latestDecision.reasoning}"
-                  </p>
-                </div>
-              </div>
-            )}
-
-            <div className="glass-panel">
-              <div className="panel-header">
-                <span className="panel-title"><TermIcon size={16} /> System Operations Log</span>
-                <span style={{ fontSize: '0.7rem', color: 'var(--color-text-dark)', cursor: 'pointer' }} onClick={handleClearLogs}>Clear</span>
-              </div>
-              <div className="log-terminal">
-                {logs.slice().reverse().map((log, idx) => (
-                  <div key={idx} className={`log-entry ${log.type}`}>
-                    <span className="log-time">{new Date(log.timestamp).toLocaleTimeString()}</span>
-                    <span className="log-message">{log.message}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* AETHER MARKET INTELLIGENCE PANEL */}
-            <div className="glass-panel" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <div className="panel-header">
-                <span className="panel-title" style={{ color: 'var(--color-secondary)', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <Activity size={16} /> Aether Market Intelligence
-                </span>
-              </div>
-              
-              <div className="market-intel-grid">
-                <div className="intel-column">
-                  <span className="intel-title">Technical Signals Matrix</span>
-                  <div className="intel-table">
-                    <div className="intel-row">
-                      <span className="intel-label">SMA Trend (9/21)</span>
-                      <span className="intel-value">
-                        {status?.latestDecision?.indicators?.sma9 && status?.latestDecision?.indicators?.sma21 ? (
-                          status.latestDecision.indicators.sma9 > status.latestDecision.indicators.sma21 ? (
-                            <span className="intel-badge bullish">Bullish (Golden Cross)</span>
-                          ) : (
-                            <span className="intel-badge bearish">Bearish (Death Cross)</span>
-                          )
-                        ) : (
-                          <span className="intel-badge neutral">N/A</span>
-                        )}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                      <span className="text-muted">Market Valuation</span>
+                      <span style={{ fontWeight: '600', color: holdingsValuation > 0 ? 'var(--term-accent-cyan)' : '#fff' }}>
+                        ${holdingsValuation.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </span>
                     </div>
-                    
-                    <div className="intel-row">
-                      <span className="intel-label">RSI Strength (14)</span>
-                      <span className="intel-value">
-                        {status?.latestDecision?.indicators?.rsi ? (
-                          <>
-                            <span style={{ marginRight: '6px' }}>{status.latestDecision.indicators.rsi.toFixed(2)}</span>
-                            {status.latestDecision.indicators.rsi > 70 ? (
-                              <span className="intel-badge bearish">Overbought</span>
-                            ) : status.latestDecision.indicators.rsi < 30 ? (
-                              <span className="intel-badge bullish">Oversold</span>
-                            ) : (
-                              <span className="intel-badge neutral">Neutral</span>
-                            )}
-                          </>
-                        ) : 'N/A'}
-                      </span>
-                    </div>
-
-                    <div className="intel-row">
-                      <span className="intel-label">MACD Momentum</span>
-                      <span className="intel-value">
-                        {status?.latestDecision?.indicators?.macd ? (
-                          <>
-                            <span style={{ marginRight: '6px' }}>{status.latestDecision.indicators.macd.toFixed(4)}</span>
-                            {status.latestDecision.indicators.macd > 0 ? (
-                              <span className="intel-badge bullish">Positive Hist</span>
-                            ) : (
-                              <span className="intel-badge bearish">Negative Hist</span>
-                            )}
-                          </>
-                        ) : 'N/A'}
-                      </span>
-                    </div>
-
-                    <div className="intel-row">
-                      <span className="intel-label">Awesome Oscillator (AO)</span>
-                      <span className="intel-value">
-                        {status?.latestDecision?.indicators?.ao ? (
-                          <>
-                            <span style={{ marginRight: '6px' }}>{status.latestDecision.indicators.ao.toFixed(4)}</span>
-                            {status.latestDecision.indicators.ao > 0 ? (
-                              <span className="intel-badge bullish">Bullish Wave</span>
-                            ) : (
-                              <span className="intel-badge bearish">Bearish Wave</span>
-                            )}
-                          </>
-                        ) : 'N/A'}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="intel-column">
-                  <span className="intel-title">Active Risk Safeguards</span>
-                  <div className="intel-table">
-                    {holdingsInfo.amount > 0 ? (
-                      <>
-                        <div className="intel-row">
-                          <span className="intel-label">Hard Stop-Loss</span>
-                          <span className="intel-value">
-                            {status?.settings?.stopLossPct > 0 ? (
-                              <>
-                                <span style={{ marginRight: '6px' }}>
-                                  ${(holdingsInfo.avgEntryPrice * (1 - status.settings.stopLossPct / 100)).toFixed(4)}
-                                </span>
-                                <span className="intel-badge bearish">
-                                  -{status.settings.stopLossPct}% Stop
-                                </span>
-                              </>
-                            ) : (
-                              <span className="intel-badge neutral">Disabled</span>
-                            )}
-                          </span>
-                        </div>
-
-                        <div className="intel-row">
-                          <span className="intel-label">Trailing Stop-Loss</span>
-                          <span className="intel-value">
-                            {status?.settings?.trailingStopEnabled ? (
-                              <>
-                                <span style={{ marginRight: '6px' }}>
-                                  ${(peakPrice * (1 - (status.settings.trailingStopPct || 2.5) / 100)).toFixed(4)}
-                                </span>
-                                <span className="intel-badge bearish">
-                                  -{status.settings.trailingStopPct}% Trail (Peak: ${peakPrice.toFixed(4)})
-                                </span>
-                              </>
-                            ) : (
-                              <span className="intel-badge neutral">Disabled</span>
-                            )}
-                          </span>
-                        </div>
-
-                        <div className="intel-row">
-                          <span className="intel-label">ATR Volatility Stop</span>
-                          <span className="intel-value">
-                            {status?.settings?.atrStopEnabled && status?.latestDecision?.indicators?.atr ? (
-                              <>
-                                <span style={{ marginRight: '6px' }}>
-                                  ${(holdingsInfo.avgEntryPrice - (status.settings.atrStopMultiplier || 2.0) * status.latestDecision.indicators.atr).toFixed(4)}
-                                </span>
-                                <span className="intel-badge bearish">
-                                  {status.settings.atrStopMultiplier}x ATR (ATR: {status.latestDecision.indicators.atr.toFixed(4)})
-                                </span>
-                              </>
-                            ) : (
-                              <span className="intel-badge neutral">Disabled</span>
-                            )}
-                          </span>
-                        </div>
-
-                        <div className="intel-row">
-                          <span className="intel-label">Take-Profit Target</span>
-                          <span className="intel-value">
-                            {status?.settings?.takeProfitEnabled ? (
-                              <>
-                                <span style={{ marginRight: '6px' }}>
-                                  ${(holdingsInfo.avgEntryPrice * (1 + (status.settings.takeProfitPct || 10.0) / 100)).toFixed(4)}
-                                </span>
-                                <span className="intel-badge bullish">
-                                  +{status.settings.takeProfitPct}% Target
-                                </span>
-                              </>
-                            ) : (
-                              <span className="intel-badge neutral">Disabled</span>
-                            )}
-                          </span>
-                        </div>
-                      </>
-                    ) : (
-                      <div style={{ textAlign: 'center', padding: '16px 0', color: 'var(--color-text-dark)', fontSize: '0.8rem' }}>
-                        No open positions. Safety stops will initialize upon trade entry.
+                    {holdingsInfo.amount > 0 && (
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', borderTop: '1px dashed rgba(255,255,255,0.03)', paddingTop: '3px' }}>
+                        <span className="text-muted">Active Position</span>
+                        <span style={{ color: 'var(--term-green)', fontWeight: 'bold' }}>
+                          {holdingsInfo.amount.toFixed(4)} {assetName}
+                        </span>
                       </div>
                     )}
                   </div>
                 </div>
               </div>
+
+              {/* Active Positions & Trust Integrity Visualizer */}
+              <div className="term-panel" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <div className="term-panel-header">
+                  <span>Active Positions & Trust Indicators</span>
+                </div>
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: '8px 10px' }}>
+                  {holdingsInfo.amount > 0 ? (
+                    <div style={{ 
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px',
+                      flex: 1,
+                      minHeight: 0,
+                      overflowY: 'auto',
+                      paddingRight: '4px'
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontWeight: 'bold', fontSize: '0.8rem', color: '#fff' }}>{assetName.split('/')[0]} Long Position</span>
+                        <span className="intel-badge bullish" style={{ fontSize: '0.6rem', padding: '1px 5px', borderRadius: '4px', color: 'var(--term-green)', background: 'rgba(74, 222, 128, 0.08)', border: '1px solid rgba(74, 222, 128, 0.15)' }}>Active</span>
+                      </div>
+                      
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Position Size</span>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>{holdingsInfo.amount.toFixed(6)} {assetName.split('/')[0]}</span>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Entry Price</span>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Current Price</span>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>${currentAssetPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Unrealized P&L</span>
+                          <span style={{ 
+                            fontFamily: 'var(--font-mono)', 
+                            fontSize: '0.74rem', 
+                            fontWeight: 'bold', 
+                            marginTop: '1px',
+                            color: (currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount >= 0 ? 'var(--term-green)' : 'var(--term-red)'
+                          }}>
+                            {((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount) >= 0 ? '+' : ''}
+                            ${((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount).toFixed(2)} 
+                            <span style={{ fontSize: '0.62rem', marginLeft: '4px', fontWeight: 'normal' }}>
+                              ({holdingsInfo.avgEntryPrice > 0 ? (((currentAssetPrice - holdingsInfo.avgEntryPrice) / holdingsInfo.avgEntryPrice) * 100).toFixed(2) : '0.00'}%)
+                            </span>
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Visual Position progress bar / gauge */}
+                      {(() => {
+                        const stops = status?.activeTradeStops;
+                        if (!stops) return null;
+
+                        const activeStopsList = [];
+                        if (stops.stopLossPrice) activeStopsList.push(stops.stopLossPrice);
+                        if (stops.atrStopPrice) activeStopsList.push(stops.atrStopPrice);
+                        if (stops.trailingStopPrice) activeStopsList.push(stops.trailingStopPrice);
+                        
+                        const activeFloor = activeStopsList.length > 0 ? Math.max(...activeStopsList) : (holdingsInfo.avgEntryPrice * 0.9);
+                        const activeCeiling = stops.takeProfitPrice || (holdingsInfo.avgEntryPrice * 1.1);
+                        
+                        const totalRange = activeCeiling - activeFloor;
+                        const gaugePercent = totalRange > 0 ? Math.max(0, Math.min(100, ((currentAssetPrice - activeFloor) / totalRange) * 100)) : 50;
+                        const entryPercent = totalRange > 0 ? Math.max(0, Math.min(100, ((holdingsInfo.avgEntryPrice - activeFloor) / totalRange) * 100)) : 50;
+                        
+                        return (
+                          <div style={{ marginTop: '2px', borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '6px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.6rem', fontWeight: 'bold', color: 'var(--term-accent-cyan)', marginBottom: '3px' }}>
+                              <span>TRADE INTEGRITY BOUNDARY</span>
+                              <span style={{ fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontWeight: 'normal' }}>
+                                Floor: {activeStopsList.length > 0 ? 'Active stops' : 'Estimated Floor'}
+                              </span>
+                            </div>
+                            
+                            <div style={{ position: 'relative', height: '14px', margin: '6px 0', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.05)', overflow: 'hidden' }}>
+                              {/* Drawdown Zone (Red) */}
+                              <div style={{ position: 'absolute', left: '0', width: `${entryPercent}%`, height: '100%', background: 'linear-gradient(90deg, rgba(239, 68, 68, 0.15) 0%, rgba(239, 68, 68, 0.03) 100%)' }} />
+                              {/* Profit Zone (Green) */}
+                              <div style={{ position: 'absolute', left: `${entryPercent}%`, right: '0', height: '100%', background: 'linear-gradient(90deg, rgba(34, 197, 94, 0.03) 0%, rgba(34, 197, 94, 0.15) 100%)' }} />
+                              
+                              {/* Entry Price Line marker */}
+                              <div style={{ position: 'absolute', left: `${entryPercent}%`, top: '0', bottom: '0', width: '2px', backgroundColor: 'rgba(255,255,255,0.35)', zIndex: 2 }} />
+                              
+                              {/* Current Price Marker */}
+                              <div style={{ 
+                                position: 'absolute', 
+                                left: `${gaugePercent}%`, 
+                                top: '50%', 
+                                transform: 'translate(-50%, -50%)', 
+                                width: '6px', 
+                                height: '6px', 
+                                borderRadius: '50%', 
+                                backgroundColor: currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--term-green)' : 'var(--term-red)', 
+                                boxShadow: `0 0 8px ${currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--term-green)' : 'var(--term-red)'}`,
+                                zIndex: 3
+                              }} />
+                            </div>
+                            
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                              <span title="Closest Stop Floor" style={{ color: activeStopsList.length > 0 ? 'var(--term-red)' : 'inherit' }}>
+                                Floor: ${activeFloor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                              </span>
+                              <span title="Entry Price">
+                                Entry: ${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                              </span>
+                              <span title="Take Profit Target" style={{ color: stops.takeProfitPrice ? 'var(--term-green)' : 'inherit' }}>
+                                Target: ${activeCeiling.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Stop details list */}
+                      {(() => {
+                        const stops = status?.activeTradeStops;
+                        if (!stops) return null;
+
+                        const formatRow = (name, val, isEnabled, isProfit = false) => {
+                          if (!isEnabled || !val) return null;
+                          const pct = (((val - currentAssetPrice) / currentAssetPrice) * 100);
+                          return (
+                            <div key={name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.62rem', padding: '2px 0', borderBottom: '1px dashed rgba(255,255,255,0.015)' }}>
+                              <span className="text-muted" style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: isProfit ? 'var(--term-green)' : 'var(--term-red)' }}></span>
+                                {name}
+                              </span>
+                              <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: '#fff' }}>
+                                ${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                <span style={{ marginLeft: '4px', fontSize: '0.58rem', color: isProfit ? 'var(--term-green)' : 'var(--term-red)' }}>
+                                  ({pct >= 0 ? '+' : ''}{pct.toFixed(2)}%)
+                                </span>
+                              </span>
+                            </div>
+                          );
+                        };
+
+                        const hasAnyStop = stops.stopLossPrice || stops.atrStopPrice || stops.trailingStopPrice || stops.takeProfitPrice;
+
+                        return hasAnyStop ? (
+                          <div style={{ borderTop: '1px dashed rgba(255,255,255,0.03)', paddingTop: '6px', marginTop: '2px' }}>
+                            <span style={{ fontSize: '0.58rem', textTransform: 'uppercase', color: 'var(--term-text-secondary)', fontWeight: 'bold', display: 'block', marginBottom: '3px' }}>
+                              ACTIVE SAFETY LIMITS
+                            </span>
+                            {formatRow('Hard Stop Loss', stops.stopLossPrice, !!stops.stopLossPrice)}
+                            {formatRow('ATR Volatility Stop', stops.atrStopPrice, !!stops.atrStopPrice)}
+                            {formatRow('Trailing Stop Loss', stops.trailingStopPrice, !!stops.trailingStopPrice)}
+                            {formatRow('Take Profit Target', stops.takeProfitPrice, !!stops.takeProfitPrice, true)}
+                          </div>
+                        ) : null;
+                      })()}
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: '16px', color: 'var(--term-text-secondary)', fontSize: '0.72rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: '8px' }}>
+                      <div className="radar-pulse" style={{ width: '12px', height: '12px', borderRadius: '50%', background: 'var(--term-accent-cyan)', boxShadow: '0 0 10px var(--term-accent-cyan)', animation: 'pulse-glow 2s infinite ease-in-out' }} />
+                      <span style={{ color: '#fff', fontSize: '0.75rem', fontWeight: 'bold', letterSpacing: '0.5px' }}>BOT IS ONLINE & SCANNING</span>
+                      <span style={{ fontSize: '0.64rem', color: 'var(--term-text-secondary)' }}>Monitoring markets for Elliott Wave patterns and momentum triggers.</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Recent Execution Fills (Simplified Left-Column Log) */}
+              <div className="term-panel" style={{ height: '240px', minHeight: '240px', maxHeight: '240px', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+                <div className="term-panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>Recent Execution Fills</span>
+                  <span className="text-muted" style={{ fontSize: '0.6rem', textTransform: 'none' }}>Fills Ledger</span>
+                </div>
+                <div style={{ flex: 1, overflowY: 'auto', padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '6px', minHeight: 0 }}>
+                  {trades.length === 0 ? (
+                    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--term-text-secondary)', fontSize: '0.72rem' }}>
+                      No recent executions.
+                    </div>
+                  ) : (
+                    trades.slice(0, 10).map((trade, idx) => {
+                      const tradeTime = new Date(trade.timestamp);
+                      const formattedTime = tradeTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + tradeTime.toLocaleDateString([], { month: 'short', day: 'numeric' });
+                      const assetName = trade.symbol.split('/')[0];
+                      const isBuy = trade.action.toUpperCase() === 'BUY';
+                      
+                      return (
+                        <div key={`fill-${idx}`} style={{ 
+                          display: 'flex', 
+                          justifyContent: 'space-between', 
+                          alignItems: 'center', 
+                          padding: '5px 8px', 
+                          background: 'rgba(255, 255, 255, 0.01)', 
+                          border: '1px solid rgba(255, 255, 255, 0.03)', 
+                          borderRadius: '6px',
+                          fontSize: '0.7rem'
+                        }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span style={{ 
+                              fontSize: '0.58rem', 
+                              padding: '2px 5px', 
+                              borderRadius: '4px',
+                              fontWeight: 'bold',
+                              textTransform: 'uppercase',
+                              color: isBuy ? 'var(--term-green)' : 'var(--term-accent-coral)',
+                              background: isBuy ? 'rgba(74, 222, 128, 0.08)' : 'rgba(248, 113, 113, 0.08)'
+                            }}>
+                              {trade.action}
+                            </span>
+                            <div>
+                              <span style={{ color: '#fff', fontWeight: 'bold' }}>{assetName}</span>
+                              <span style={{ color: 'var(--term-text-secondary)', marginLeft: '6px', fontSize: '0.65rem' }}>
+                                {trade.amount.toFixed(4)} @ ${trade.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                              </span>
+                            </div>
+                          </div>
+                          <span style={{ color: 'var(--term-text-secondary)', fontSize: '0.62rem', fontFamily: 'var(--font-mono)' }}>
+                            {formattedTime}
+                          </span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
             </div>
-          </main>
+
+            {/* Center Column: AI Assistant & Custom Canvas Chart */}
+            <div className="terminal-col-center" style={{ position: 'relative' }}>
+              <JarvisCore animating={chatLoading} />
+              <div className="term-panel term-chat-panel" style={{ height: '460px', minHeight: '460px', maxHeight: '460px', display: 'flex', flexDirection: 'column', flexShrink: 0, padding: 0 }}>
+                <div className="term-panel-header" style={{ padding: '12px 16px', borderBottom: '1px solid rgba(255,255,255,0.04)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <MessageSquare size={16} /> Aether AI Assistant
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <button 
+                      type="button"
+                      onClick={handleClearChat}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        color: 'rgba(255,255,255,0.4)',
+                        cursor: 'pointer',
+                        fontSize: '0.7rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        transition: 'all 0.2s'
+                      }}
+                      onMouseOver={(e) => { e.currentTarget.style.color = 'var(--term-red)'; e.currentTarget.style.background = 'rgba(239, 68, 68, 0.08)'; }}
+                      onMouseOut={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.4)'; e.currentTarget.style.background = 'none'; }}
+                      title="Clear chat history"
+                    >
+                      Clear History
+                    </button>
+                    <span className="intel-badge neutral" style={{ fontSize: '0.65rem' }}>Core Online</span>
+                  </div>
+                </div>
+
+
+
+                {/* Chat messages scrolling log */}
+                <div 
+                  ref={chatScrollRef}
+                  onScroll={handleChatScroll}
+                  className="term-chat-messages"
+                  style={{ position: 'relative', zIndex: 1 }}
+                >
+                  {chatMessages.map((msg, idx) => (
+                    <div
+                      key={`dash-msg-${idx}`}
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        width: '100%',
+                        alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                      }}
+                    >
+                      <div className={msg.role === 'user' ? 'term-chat-bubble-user' : ''} style={{
+                        maxWidth: '85%',
+                        padding: '6px 10px',
+                        borderRadius: '12px',
+                        background: msg.role === 'user' ? 'rgba(255, 255, 255, 0.04)' : 'rgba(255, 255, 255, 0.02)',
+                        border: msg.role === 'user' ? '1px solid rgba(255, 255, 255, 0.08)' : '1px solid rgba(255, 255, 255, 0.04)',
+                        color: '#fff',
+                        fontSize: '0.75rem',
+                        lineHeight: '1.3'
+                      }}>
+                        {msg.role === 'user' ? (
+                          <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+                        ) : (
+                          msg.isNew ? (
+                            <TypewriterMessage 
+                              content={msg.content} 
+                              scrollContainerRef={chatScrollRef}
+                              chatAutoScroll={chatAutoScroll}
+                              onComplete={() => handleTypewriterComplete(idx)}
+                            />
+                          ) : (
+                            formatChatMessage(msg.content)
+                          )
+                        )}
+                      </div>
+                      <span style={{ fontSize: '0.6rem', color: 'var(--term-text-secondary)', marginTop: '3px' }}>
+                        {msg.role === 'user' ? 'You' : 'Aether Bot'}
+                      </span>
+                    </div>
+                  ))}
+
+                  {chatLoading && (
+                    <div style={{
+                      alignSelf: 'flex-start',
+                      width: '100%',
+                      maxWidth: '85%',
+                      padding: '8px 12px',
+                      borderRadius: '12px',
+                      background: 'rgba(255, 255, 255, 0.015)',
+                      border: '1px dashed rgba(255, 255, 255, 0.15)',
+                      color: '#fff',
+                      fontSize: '0.75rem',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px',
+                      boxShadow: 'var(--shadow-glow-orange)'
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <div style={{ position: 'relative', width: '24px', height: '24px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <Cpu size={14} style={{ color: 'var(--term-accent-coral)', animation: 'spin-slow 3s linear infinite' }} />
+                          <span style={{
+                            position: 'absolute', width: '100%', height: '100%', borderRadius: '50%',
+                            border: '1px dashed var(--term-accent-coral)', animation: 'spin-slow 8s linear infinite'
+                          }} />
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <span style={{ fontWeight: '700', letterSpacing: '0.5px', color: 'var(--term-accent-coral)', fontSize: '0.72rem' }}>AETHER COGNITIVE ENGINE</span>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--term-text-secondary)', fontWeight: '500' }}>STATUS: ACTIVE REASONING LOOP</span>
+                        </div>
+                      </div>
+                      
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '8px' }}>
+                        {thinkingStages.map((stage, sIdx) => {
+                          const isDone = sIdx < thinkingStep;
+                          const isActive = sIdx === thinkingStep;
+                          return (
+                            <div key={sIdx} style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '8px',
+                              fontSize: '0.7rem',
+                              color: isDone ? 'var(--term-green)' : isActive ? '#fff' : 'var(--term-text-secondary)',
+                              transition: 'color 0.2s ease',
+                              fontWeight: isActive ? '600' : '400'
+                            }}>
+                              <span style={{
+                                width: '4px',
+                                height: '4px',
+                                borderRadius: '50%',
+                                background: isDone ? 'var(--term-green)' : isActive ? 'var(--term-accent-coral)' : 'rgba(255,255,255,0.1)',
+                                boxShadow: isActive ? '0 0 6px var(--term-accent-coral)' : 'none',
+                                display: 'inline-block'
+                              }} />
+                              <span>{stage}</span>
+                              {isActive && <span style={{ animation: 'flash 1s infinite alternate', fontSize: '0.7rem', color: 'var(--term-accent-coral)', marginLeft: '2px' }}>▌</span>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Chat Input form */}
+                <form onSubmit={handleSendChatMessage} className="term-chat-input-form">
+                  <input
+                    ref={chatInputRef}
+                    type="text"
+                    className="term-chat-input"
+                    placeholder="Ask about your portfolio, trades, or market structure..."
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                  />
+                  <button
+                    type="submit"
+                    className="term-chat-send"
+                    disabled={chatLoading || !chatInput.trim()}
+                  >
+                    Send
+                  </button>
+                </form>
+              </div>
+
+              {/* Custom Candlestick Trading Chart (Native, Transparent) */}
+              <div className="term-panel term-chart-card">
+                <div className="term-panel-header">
+                  <span>{status?.settings?.selectedAsset || 'BTC/USD'} Chart Terminal</span>
+                </div>
+                <div className="term-chart-frame">
+                  <CustomTradingChart candleData={candleData} symbol={status?.settings?.selectedAsset || 'BTC/USD'} />
+                </div>
+              </div>
+            </div>
+
+            {/* Right Column: Cognitive Operations Analysis & Technical Indicators Matrix */}
+            <div className="terminal-col-right">
+
+              {/* Multi-Timeframe Trend & Regime Matrix */}
+              <div className="term-panel multi-tf-term-panel" style={{ height: '330px', minHeight: '330px', maxHeight: '330px', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+                <div className="term-panel-header">
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Activity size={16} style={{ color: 'var(--color-primary)' }} />
+                    <span>Multi-Timeframe Trend Matrix</span>
+                  </span>
+                </div>
+                <div style={{ 
+                  flex: 1, 
+                  minHeight: 0, 
+                  background: 'rgba(0, 0, 0, 0.2)', 
+                  border: '1px solid rgba(255, 255, 255, 0.04)', 
+                  borderRadius: '6px',
+                  padding: '8px 10px',
+                  overflow: 'hidden'
+                }}>
+                  {multiIndicators ? (
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', color: 'var(--color-text-muted)' }}>
+                      <thead>
+                        <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.06)', textTransform: 'uppercase', fontSize: '0.62rem', letterSpacing: '0.5px' }}>
+                          <th style={{ textAlign: 'left', padding: '6px 4px', color: 'var(--color-text)' }}>TF</th>
+                          <th style={{ textAlign: 'right', padding: '6px 4px', color: 'var(--color-text)' }}>Price</th>
+                          <th style={{ textAlign: 'center', padding: '6px 4px', color: 'var(--color-text)' }}>Regime</th>
+                          <th style={{ textAlign: 'center', padding: '6px 4px', color: 'var(--color-text)' }}>RSI</th>
+                          <th style={{ textAlign: 'center', padding: '6px 4px', color: 'var(--color-text)' }}>SMA Cross</th>
+                          <th style={{ textAlign: 'center', padding: '6px 4px', color: 'var(--color-text)' }}>ADX</th>
+                          <th style={{ textAlign: 'center', padding: '6px 4px', color: 'var(--color-text)' }}>RVol</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {['15m', '1h', '4h', '1d'].map(tf => {
+                          const tfData = multiIndicators[tf] || {};
+                          
+                          const rsiVal = tfData.rsi;
+                          const rsiStatus = rsiVal === undefined ? 'neutral' : rsiVal < 30 ? 'bullish' : rsiVal > 70 ? 'bearish' : 'neutral';
+                          
+                          const smaStatus = tfData.sma9 === undefined ? 'neutral' : tfData.sma9 > tfData.sma21 ? 'bullish' : 'bearish';
+                          const adxStatus = tfData.adx === undefined ? 'neutral' : tfData.adx > 25 ? 'bullish' : 'neutral';
+                          const rvolStatus = tfData.rvol === undefined ? 'neutral' : tfData.rvol > 1.5 ? 'bullish' : 'neutral';
+                          
+                          const regimeText = tfData.regime ? tfData.regime.replace(/_/g, ' ') : 'LOADING';
+                          
+                          const getRegimeColor = (regime) => {
+                            if (regime === 'TRENDING_BULLISH') return 'var(--term-green)';
+                            if (regime === 'TRENDING_BEARISH') return 'var(--term-red)';
+                            return 'rgba(255, 255, 255, 0.4)'; // neutral
+                          };
+                          
+                          const getRegimeShadow = (regime) => {
+                            const color = getRegimeColor(regime);
+                            return `0 0 6px ${color}`;
+                          };
+
+                          const getCellColor = (status) => {
+                            if (status === 'bullish') return 'var(--term-green)';
+                            if (status === 'bearish') return 'var(--term-red)';
+                            return 'var(--color-text-muted)';
+                          };
+
+                          return (
+                            <tr key={tf} style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.02)', height: '38px' }}>
+                              <td style={{ fontWeight: 'bold', color: '#fff', padding: '4px' }}>{tf}</td>
+                              <td style={{ textAlign: 'right', fontFamily: 'var(--font-mono)', padding: '4px', color: '#fff' }}>
+                                {tfData.price ? `$${tfData.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '-'}
+                              </td>
+                              <td style={{ textAlign: 'center', padding: '4px' }}>
+                                <div 
+                                  title={regimeText}
+                                  style={{ 
+                                    width: '8px', 
+                                    height: '8px', 
+                                    borderRadius: '50%', 
+                                    backgroundColor: getRegimeColor(tfData.regime), 
+                                    boxShadow: getRegimeShadow(tfData.regime), 
+                                    display: 'inline-block',
+                                    verticalAlign: 'middle',
+                                    cursor: 'help'
+                                  }} 
+                                />
+                              </td>
+                              <td style={{ textAlign: 'center', padding: '4px', fontFamily: 'var(--font-mono)', color: getCellColor(rsiStatus), fontWeight: rsiStatus !== 'neutral' ? 'bold' : 'normal' }}>
+                                {rsiVal ? rsiVal.toFixed(1) : '-'}
+                              </td>
+                              <td style={{ textAlign: 'center', padding: '4px', color: getCellColor(smaStatus), fontWeight: 'bold', fontSize: '0.65rem' }}>
+                                {tfData.sma9 ? `${tfData.sma9 > tfData.sma21 ? 'Golden' : 'Death'}` : '-'}
+                              </td>
+                              <td style={{ textAlign: 'center', padding: '4px', fontFamily: 'var(--font-mono)', color: getCellColor(adxStatus) }}>
+                                {tfData.adx ? tfData.adx.toFixed(1) : '-'}
+                              </td>
+                              <td style={{ textAlign: 'center', padding: '4px', fontFamily: 'var(--font-mono)', color: getCellColor(rvolStatus) }}>
+                                {tfData.rvol ? `${tfData.rvol.toFixed(1)}x` : '-'}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: '12px', color: 'var(--color-text-muted)' }}>
+                      <div className="spinner" style={{ width: '24px', height: '24px', borderRadius: '50%', border: '2px solid rgba(255,255,255,0.05)', borderTopColor: 'var(--color-primary)', animation: 'spin 1s linear infinite' }} />
+                      <span style={{ fontSize: '0.75rem', letterSpacing: '0.5px' }}>Retrieving live multi-timeframe market matrix...</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* System Operations Log (Dashboard View - Expanded) */}
+              <div className="term-panel" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <div className="term-panel-header">
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '8px', fontFamily: 'var(--font-mono)' }}>
+                    {`>_`} SYSTEM OPERATIONS LOG
+                  </span>
+                </div>
+                <div className="log-terminal" style={{ flex: 1, minHeight: 0, background: 'rgba(0, 0, 0, 0.2)', border: '1px solid rgba(255,255,255,0.02)', borderRadius: '8px', padding: '8px' }}>
+                  {logs.slice(0, 30).reverse().map((log, idx) => (
+                    <div key={idx} className={`log-entry ${log.type}`} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px', paddingBottom: '6px', borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
+                      <span className="log-message" style={{ width: '100%', wordBreak: 'break-word', fontSize: '0.72rem' }}>{log.message}</span>
+                      <span className="log-time" style={{ fontSize: '0.58rem', marginTop: '1px' }}>{safeFormatDate(log.timestamp, true)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {(() => {
+                const indicators = status?.latestDecision?.indicators || {};
+                const rsi = indicators.rsi !== undefined && indicators.rsi !== null ? indicators.rsi : 48.5;
+                const sma9 = indicators.sma9 || 0;
+                const sma21 = indicators.sma21 || 0;
+                const ao = indicators.ao !== undefined && indicators.ao !== null ? indicators.ao : 12.4;
+                const macd = indicators.macd !== undefined && indicators.macd !== null ? indicators.macd : 0.05;
+                const adx = indicators.adx !== undefined && indicators.adx !== null ? indicators.adx : 24.2;
+                const rvol = indicators.rvol !== undefined && indicators.rvol !== null ? indicators.rvol : 1.15;
+                const regime = indicators.marketRegime || "TRANSITIONING_ZONE";
+
+                // helper for indicator status class
+                const getRsiStatus = (val) => val < 30 ? 'bullish' : val > 70 ? 'bearish' : 'neutral';
+                const getMacdStatus = (val) => val > 0 ? 'bullish' : val < 0 ? 'bearish' : 'neutral';
+                const getAoStatus = (val) => val > 0 ? 'bullish' : val < 0 ? 'bearish' : 'neutral';
+                const getSmaStatus = (s9, s21) => {
+                  if (!s9 || !s21) return 'neutral';
+                  return s9 > s21 ? 'bullish' : 'bearish';
+                };
+                const getAdxStatus = (val) => val > 25 ? 'bullish' : val < 20 ? 'bearish' : 'neutral';
+                const getRvolStatus = (val) => val > 1.5 ? 'bullish' : val < 0.8 ? 'bearish' : 'neutral';
+
+                // helper for left-accent border color
+                const getStatusColor = (statusName) => {
+                  if (statusName === 'bullish') return 'var(--term-green)';
+                  if (statusName === 'bearish') return 'var(--term-red)';
+                  return '#475569';
+                };
+
+                return (
+                  <div className="term-panel" style={{ gap: '6px', padding: '8px 10px', flexShrink: 0 }}>
+                    <div className="term-panel-header" style={{ paddingBottom: '4px', borderBottom: '1px solid rgba(255, 255, 255, 0.04)' }}>
+                      <span>Indicators</span>
+                      <span style={{ fontSize: '0.62rem', fontWeight: 'bold', letterSpacing: '0.2px', color: regime.includes('BULL') ? 'var(--term-green)' : regime.includes('BEAR') ? 'var(--term-red)' : '#fff' }}>
+                        {regime.replace(/_/g, ' ')}
+                      </span>
+                    </div>
+
+                    <div className="indicators-term-grid">
+                      {/* RSI */}
+                      <div className="indicator-tile" style={{ borderLeft: `3px solid ${getStatusColor(getRsiStatus(rsi))}` }}>
+                        <div className="indicator-tile-header">
+                          <span className="indicator-tile-name">RSI (14)</span>
+                          <span className={`indicator-tile-status ${getRsiStatus(rsi)}`}>
+                            {rsi < 30 ? 'Oversold' : rsi > 70 ? 'Overbought' : 'Neutral'}
+                          </span>
+                        </div>
+                        <span className="indicator-tile-val">{rsi.toFixed(2)}</span>
+                      </div>
+
+                      {/* MACD */}
+                      <div className="indicator-tile" style={{ borderLeft: `3px solid ${getStatusColor(getMacdStatus(macd))}` }}>
+                        <div className="indicator-tile-header">
+                          <span className="indicator-tile-name">MACD Hist</span>
+                          <span className={`indicator-tile-status ${getMacdStatus(macd)}`}>
+                            {macd > 0 ? 'Bullish' : macd < 0 ? 'Bearish' : 'Neutral'}
+                          </span>
+                        </div>
+                        <span className="indicator-tile-val">{macd.toFixed(4)}</span>
+                      </div>
+
+                      {/* AO */}
+                      <div className="indicator-tile" style={{ borderLeft: `3px solid ${getStatusColor(getAoStatus(ao))}` }}>
+                        <div className="indicator-tile-header">
+                          <span className="indicator-tile-name">Awesome Osc</span>
+                          <span className={`indicator-tile-status ${getAoStatus(ao)}`}>
+                            {ao > 0 ? 'Bull' : ao < 0 ? 'Bear' : 'Neutral'}
+                          </span>
+                        </div>
+                        <span className="indicator-tile-val">{ao.toFixed(2)}</span>
+                      </div>
+
+                      {/* SMA Cross */}
+                      <div className="indicator-tile" style={{ borderLeft: `3px solid ${getStatusColor(getSmaStatus(sma9, sma21))}` }}>
+                        <div className="indicator-tile-header">
+                          <span className="indicator-tile-name">SMA Cross</span>
+                          <span className={`indicator-tile-status ${getSmaStatus(sma9, sma21)}`}>
+                            {sma9 > sma21 ? 'Golden' : sma9 < sma21 ? 'Death' : 'Neutral'}
+                          </span>
+                        </div>
+                        <span className="indicator-tile-val" style={{ fontSize: '0.72rem', whiteSpace: 'nowrap', marginTop: '1px' }}>
+                          {sma9 ? `${sma9.toFixed(1)} / ${sma21.toFixed(1)}` : 'No Data'}
+                        </span>
+                      </div>
+
+                      {/* ADX */}
+                      <div className="indicator-tile" style={{ borderLeft: `3px solid ${getStatusColor(getAdxStatus(adx))}` }}>
+                        <div className="indicator-tile-header">
+                          <span className="indicator-tile-name">ADX (14)</span>
+                          <span className={`indicator-tile-status ${getAdxStatus(adx)}`}>
+                            {adx > 25 ? 'Strong' : adx < 20 ? 'Range' : 'Neutral'}
+                          </span>
+                        </div>
+                        <span className="indicator-tile-val">{adx.toFixed(2)}</span>
+                      </div>
+
+                      {/* RVol */}
+                      <div className="indicator-tile" style={{ borderLeft: `3px solid ${getStatusColor(getRvolStatus(rvol))}` }}>
+                        <div className="indicator-tile-header">
+                          <span className="indicator-tile-name">Rel Vol</span>
+                          <span className={`indicator-tile-status ${getRvolStatus(rvol)}`}>
+                            {rvol > 1.5 ? 'High' : rvol < 0.8 ? 'Low' : 'Normal'}
+                          </span>
+                        </div>
+                        <span className="indicator-tile-val">{rvol.toFixed(2)}x</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1171,18 +2437,6 @@ export default function App() {
               <span className="panel-title"><Sliders size={16} /> Manual Execution</span>
             </div>
             
-            {status?.settings?.tradingMode === 'live' ? (
-              <div className="alert-banner" style={{ background: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.25)', color: '#fca5a5' }}>
-                <AlertTriangle size={18} style={{ flexShrink: 0 }} />
-                <span><strong>REAL MONEY ORDER:</strong> Buys and sells placed here will execute live market orders on Coinbase Advanced. Proceed with caution!</span>
-              </div>
-            ) : (
-              <div className="alert-banner info">
-                <AlertTriangle size={18} style={{ flexShrink: 0 }} />
-                <span>Simulate manual fills on the paper exchange. Feeds trade logs and updates portfolio cash balance.</span>
-              </div>
-            )}
-
             <div className="form-group" style={{ marginTop: '8px' }}>
               <label className="form-label">Position Allocation ({manualTrade.amountPct}%)</label>
               <input 
@@ -1274,7 +2528,11 @@ export default function App() {
                   <option value="1m">1 Minute</option>
                   <option value="5m">5 Minutes</option>
                   <option value="15m">15 Minutes</option>
+                  <option value="30m">30 Minutes</option>
                   <option value="1h">1 Hour</option>
+                  <option value="2h">2 Hours</option>
+                  <option value="4h">4 Hours</option>
+                  <option value="6h">6 Hours</option>
                   <option value="1d">1 Day</option>
                 </select>
               </div>
@@ -1414,7 +2672,7 @@ export default function App() {
                           <div className="trade-item-left" style={{ width: '100%' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
                               <span className={`trade-badge ${t.action.toLowerCase()}`}>{t.action}</span>
-                              <span className="text-muted">{new Date(t.time).toLocaleTimeString()}</span>
+                              <span className="text-muted">{safeFormatDate(t.time, true)}</span>
                             </div>
                             <span style={{ fontWeight: '600', color: '#fff', fontSize: '0.75rem', marginTop: '2px' }}>
                               {(t.amount || 0).toFixed(4)} {backtestConfig.symbol.split('/')[0]} @ ${(t.price || 0).toLocaleString()}
@@ -1450,7 +2708,7 @@ export default function App() {
           <div className="log-terminal" style={{ flex: 1 }}>
             {logs.slice().reverse().map((log, idx) => (
               <div key={idx} className={`log-entry ${log.type}`}>
-                <span className="log-time">{new Date(log.timestamp).toLocaleString()}</span>
+                <span className="log-time">{safeFormatDate(log.timestamp)}</span>
                 <span className="log-message">{log.message}</span>
               </div>
             ))}
@@ -1468,16 +2726,100 @@ export default function App() {
             </div>
 
             <form onSubmit={handleSaveSettings} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <div className="form-group">
-                <label className="form-label">Gemini Developer API Key</label>
-                <input 
-                  type="password" 
-                  placeholder={status.settings.geminiApiKey ? '••••••••' : 'Enter API Key...'} 
-                  className="form-input"
-                  value={settingsForm.geminiApiKey}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, geminiApiKey: e.target.value })}
-                />
-                <span className="text-muted">Stored locally on your machine. Generates trading decisions.</span>
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Active LLM Provider</label>
+                  <select 
+                    className="form-select"
+                    value={settingsForm.activeLlmProvider}
+                    onChange={(e) => {
+                      const prov = e.target.value;
+                      let defModel = "gemini-2.5-flash";
+                      if (prov === "openai") defModel = "gpt-4o";
+                      else if (prov === "claude") defModel = "claude-3-5-sonnet-latest";
+                      setSettingsForm({ ...settingsForm, activeLlmProvider: prov, activeLlmModel: defModel });
+                    }}
+                  >
+                    <option value="gemini">Google Gemini</option>
+                    <option value="openai">OpenAI ChatGPT</option>
+                    <option value="claude">Anthropic Claude</option>
+                  </select>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Active LLM Model</label>
+                  {settingsForm.activeLlmProvider === "gemini" ? (
+                    <select 
+                      className="form-select"
+                      value={settingsForm.activeLlmModel}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, activeLlmModel: e.target.value })}
+                    >
+                      <option value="gemini-2.5-flash">gemini-2.5-flash (Default)</option>
+                      <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                      <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+                    </select>
+                  ) : settingsForm.activeLlmProvider === "openai" ? (
+                    <select 
+                      className="form-select"
+                      value={settingsForm.activeLlmModel}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, activeLlmModel: e.target.value })}
+                    >
+                      <option value="gpt-4o">gpt-4o (Default)</option>
+                      <option value="gpt-4o-mini">gpt-4o-mini</option>
+                      <option value="o1-mini">o1-mini</option>
+                    </select>
+                  ) : (
+                    <select 
+                      className="form-select"
+                      value={settingsForm.activeLlmModel}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, activeLlmModel: e.target.value })}
+                    >
+                      <option value="claude-3-5-sonnet-latest">claude-3-5-sonnet-latest (Default)</option>
+                      <option value="claude-3-5-haiku-latest">claude-3-5-haiku-latest</option>
+                    </select>
+                  )}
+                </div>
+              </div>
+
+              <div className="form-group" style={{ background: 'rgba(255,255,255,0.01)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <h4 style={{ fontSize: '0.8rem', fontWeight: 'bold', color: 'var(--color-secondary)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>LLM Developer API Keys</h4>
+                
+                <div className="form-group">
+                  <label className="form-label" style={{ fontSize: '0.75rem' }}>Gemini Developer API Key</label>
+                  <input 
+                    type="password" 
+                    placeholder={status?.settings?.geminiApiKey ? '••••••••' : 'Enter API Key...'} 
+                    className="form-input"
+                    value={settingsForm.geminiApiKey}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, geminiApiKey: e.target.value })}
+                    style={{ padding: '8px 12px', fontSize: '0.8rem' }}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label" style={{ fontSize: '0.75rem' }}>OpenAI API Key</label>
+                  <input 
+                    type="password" 
+                    placeholder={status?.settings?.openaiApiKey ? '••••••••' : 'Enter API Key...'} 
+                    className="form-input"
+                    value={settingsForm.openaiApiKey}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, openaiApiKey: e.target.value })}
+                    style={{ padding: '8px 12px', fontSize: '0.8rem' }}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label" style={{ fontSize: '0.75rem' }}>Claude API Key</label>
+                  <input 
+                    type="password" 
+                    placeholder={status?.settings?.claudeApiKey ? '••••••••' : 'Enter API Key...'} 
+                    className="form-input"
+                    value={settingsForm.claudeApiKey}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, claudeApiKey: e.target.value })}
+                    style={{ padding: '8px 12px', fontSize: '0.8rem' }}
+                  />
+                </div>
+                <span className="text-muted" style={{ fontSize: '0.7rem', display: 'block', marginTop: '4px' }}>Keys are stored locally on your machine and never shared.</span>
               </div>
 
               <div className="form-row">
@@ -1511,7 +2853,11 @@ export default function App() {
                     <option value="1m">1m (Test Mode)</option>
                     <option value="5m">5m</option>
                     <option value="15m">15m</option>
+                    <option value="30m">30m</option>
                     <option value="1h">1h</option>
+                    <option value="2h">2h</option>
+                    <option value="4h">4h</option>
+                    <option value="6h">6h</option>
                     <option value="1d">1d</option>
                   </select>
                 </div>
@@ -1544,6 +2890,9 @@ export default function App() {
                       onChange={(e) => setSettingsForm({ ...settingsForm, macroTimeframe: e.target.value })}
                     >
                       <option value="1h">1h</option>
+                      <option value="2h">2h</option>
+                      <option value="4h">4h</option>
+                      <option value="6h">6h</option>
                       <option value="1d">1d (Daily Chart)</option>
                     </select>
                     <span className="text-muted">Determines the long-term trend bias for wave analysis.</span>
@@ -1662,6 +3011,24 @@ export default function App() {
                     onChange={(e) => setSettingsForm({ ...settingsForm, stopLossPct: Number(e.target.value) })}
                   />
                   <span className="text-muted">Auto-liquidation limit triggered locally. Overrides LLM decision.</span>
+                </div>
+              </div>
+
+              <div className="form-row" style={{ marginTop: '12px' }}>
+                <div className="form-group">
+                  <label className="form-label">Max Position Allocation Cap ({settingsForm.maxPositionAllocationPct || 75}%)</label>
+                  <input 
+                    type="number" 
+                    min="1" 
+                    max="100" 
+                    className="form-input"
+                    value={settingsForm.maxPositionAllocationPct || 75}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, maxPositionAllocationPct: Number(e.target.value) })}
+                  />
+                  <span className="text-muted">Max percentage of total portfolio value allowed to be held in this asset.</span>
+                </div>
+                <div className="form-group">
+                  {/* Empty to balance layout columns */}
                 </div>
               </div>
 
@@ -1884,8 +3251,27 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {/* Discord Webhook (independent of notification type) */}
+                <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                  <div className="form-group">
+                    <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style={{ color: '#5865F2' }}>
+                        <path d="M13.55 3.15A13.27 13.27 0 0010.24 2a9.14 9.14 0 00-.42.85 12.33 12.33 0 00-3.64 0A9.3 9.3 0 005.76 2a13.36 13.36 0 00-3.31 1.15A14.1 14.1 0 00.08 12.76a13.4 13.4 0 004.08 2.06 10.1 10.1 0 00.87-1.41 8.66 8.66 0 01-1.37-.66c.11-.08.23-.17.34-.26a9.55 9.55 0 008.16 0c.11.09.22.18.34.26a8.7 8.7 0 01-1.37.66c.25.5.54.97.87 1.41a13.36 13.36 0 004.08-2.06A14.07 14.07 0 0013.55 3.15zM5.35 10.84c-.85 0-1.55-.78-1.55-1.74s.68-1.74 1.55-1.74c.86 0 1.56.78 1.55 1.74 0 .96-.69 1.74-1.55 1.74zm5.3 0c-.85 0-1.55-.78-1.55-1.74s.68-1.74 1.55-1.74c.86 0 1.56.78 1.55 1.74 0 .96-.69 1.74-1.55 1.74z"/>
+                      </svg>
+                      Discord Webhook URL <span style={{ fontSize: '0.7rem', opacity: 0.5 }}>(Optional — fires alongside Telegram/SMS)</span>
+                    </label>
+                    <input 
+                      type="password"
+                      placeholder={status.settings.discordWebhookUrl ? '••••••••' : 'https://discord.com/api/webhooks/...'}
+                      className="form-input"
+                      value={settingsForm.discordWebhookUrl}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, discordWebhookUrl: e.target.value })}
+                    />
+                  </div>
+                </div>
                 
-                {settingsForm.notificationType !== 'none' && (
+                {(settingsForm.notificationType !== 'none' || settingsForm.discordWebhookUrl) && (
                   <button 
                     type="button" 
                     className="btn btn-secondary" 
@@ -1928,8 +3314,152 @@ export default function App() {
               Save Custom Strategy Prompt
             </button>
           </aside>
+
+          {/* Plugins, Tools & Strategies Card Manager */}
+          <div className="glass-panel" style={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '16px' }}>
+            <div className="panel-header" style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)', paddingBottom: '10px' }}>
+              <span className="panel-title" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--color-secondary)' }}>
+                <Layers size={18} /> Plugins, Custom Tools & Strategy Manager
+              </span>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '20px' }}>
+              {/* Custom Action Tools (.js) Card */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', background: 'rgba(255,255,255,0.01)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '8px' }}>
+                  <h4 style={{ fontSize: '0.85rem', fontWeight: 'bold', color: '#fff', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Cpu size={14} style={{ color: 'var(--color-primary)' }} /> Custom Action Tools (.js)
+                  </h4>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(16, 185, 129, 0.15)', color: '#10b981', border: '1px solid rgba(16, 185, 129, 0.25)', padding: '4px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: '600' }}>
+                    <UploadCloud size={14} /> Upload JS Tool
+                    <input type="file" accept=".js" onChange={handleUploadTool} style={{ display: 'none' }} />
+                  </label>
+                </div>
+                <p className="text-muted" style={{ fontSize: '0.7rem' }}>
+                  User-defined functions executed in a safe backend Node VM sandbox. Tools can invoke web calls, fetch prices, or trigger alerts.
+                </p>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflowY: 'auto', marginTop: '4px' }}>
+                  {customTools.length > 0 ? (
+                    customTools.map((tool) => (
+                      <div key={tool.filename} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(0,0,0,0.2)', padding: '10px 12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.03)' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1, minWidth: 0, marginRight: '12px' }}>
+                          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: tool.error ? 'var(--color-danger)' : '#fff', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                            {tool.name}
+                          </span>
+                          <span className="text-muted" style={{ fontSize: '0.68rem', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                            {tool.description}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <label className="switch" style={{ position: 'relative', display: 'inline-block', width: '34px', height: '20px' }}>
+                            <input 
+                              type="checkbox" 
+                              checked={tool.enabled} 
+                              disabled={!!tool.error}
+                              onChange={() => handleToggleTool(tool.filename)} 
+                              style={{ opacity: 0, width: 0, height: 0 }}
+                            />
+                            <span className="slider" style={{
+                              position: 'absolute', cursor: 'pointer', top: 0, left: 0, right: 0, bottom: 0,
+                              backgroundColor: tool.enabled ? 'var(--color-primary)' : 'rgba(255,255,255,0.1)',
+                              transition: '.2s', borderRadius: '20px'
+                            }}>
+                              <span style={{
+                                position: 'absolute', content: '""', height: '14px', width: '14px', left: tool.enabled ? '17px' : '3px', bottom: '3px',
+                                backgroundColor: '#fff', transition: '.2s', borderRadius: '50%'
+                              }} />
+                            </span>
+                          </label>
+                          <button 
+                            className="btn btn-secondary" 
+                            onClick={() => handleDeleteTool(tool.filename)}
+                            style={{ padding: '4px', height: 'auto', background: 'rgba(239, 68, 68, 0.1)', color: 'var(--color-danger)', border: '1px solid rgba(239, 68, 68, 0.15)' }}
+                            title="Delete tool"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: '20px', color: 'var(--color-text-dark)', fontSize: '0.75rem', border: '1px dashed rgba(255,255,255,0.05)', borderRadius: '8px' }}>
+                      No custom tools uploaded yet.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Strategy Guidelines (.md) Card */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', background: 'rgba(255,255,255,0.01)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '8px' }}>
+                  <h4 style={{ fontSize: '0.85rem', fontWeight: 'bold', color: '#fff', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Sliders size={14} style={{ color: 'var(--color-secondary)' }} /> Strategy Guidelines (.md)
+                  </h4>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(16, 185, 129, 0.15)', color: '#10b981', border: '1px solid rgba(16, 185, 129, 0.25)', padding: '4px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: '600' }}>
+                    <UploadCloud size={14} /> Upload Markdown
+                    <input type="file" accept=".md" onChange={handleUploadStrategy} style={{ display: 'none' }} />
+                  </label>
+                </div>
+                <p className="text-muted" style={{ fontSize: '0.7rem' }}>
+                  Modular rules (e.g. risk management, choppy regime filters) appended directly to the LLM system prompt context on execution. Limit: &lt; 10KB.
+                </p>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflowY: 'auto', marginTop: '4px' }}>
+                  {strategies.length > 0 ? (
+                    strategies.map((strat) => (
+                      <div key={strat.filename} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(0,0,0,0.2)', padding: '10px 12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.03)' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1, minWidth: 0, marginRight: '12px' }}>
+                          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                            {strat.title}
+                          </span>
+                          <span className="text-muted" style={{ fontSize: '0.68rem', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                            {strat.description}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <label className="switch" style={{ position: 'relative', display: 'inline-block', width: '34px', height: '20px' }}>
+                            <input 
+                              type="checkbox" 
+                              checked={strat.enabled} 
+                              onChange={() => handleToggleStrategy(strat.filename)} 
+                              style={{ opacity: 0, width: 0, height: 0 }}
+                            />
+                            <span className="slider" style={{
+                              position: 'absolute', cursor: 'pointer', top: 0, left: 0, right: 0, bottom: 0,
+                              backgroundColor: strat.enabled ? 'var(--color-secondary)' : 'rgba(255,255,255,0.1)',
+                              transition: '.2s', borderRadius: '20px'
+                            }}>
+                              <span style={{
+                                position: 'absolute', content: '""', height: '14px', width: '14px', left: strat.enabled ? '17px' : '3px', bottom: '3px',
+                                backgroundColor: '#fff', transition: '.2s', borderRadius: '50%'
+                              }} />
+                            </span>
+                          </label>
+                          <button 
+                            className="btn btn-secondary" 
+                            onClick={() => handleDeleteStrategy(strat.filename)}
+                            style={{ padding: '4px', height: 'auto', background: 'rgba(239, 68, 68, 0.1)', color: 'var(--color-danger)', border: '1px solid rgba(239, 68, 68, 0.15)' }}
+                            title="Delete strategy"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: '20px', color: 'var(--color-text-dark)', fontSize: '0.75rem', border: '1px dashed rgba(255,255,255,0.05)', borderRadius: '8px' }}>
+                      No strategy guidelines uploaded yet.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       )}
+
+
 
       {/* SYSTEM OPERATIONS MANUAL TAB */}
       {activeTab === 'manual' && (
@@ -1967,6 +3497,7 @@ export default function App() {
         </div>
       )}
 
+      </div>
     </div>
   );
 }

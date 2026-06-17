@@ -95,7 +95,52 @@ async function sendSMSAlert(smtpConfig, phoneNumber, carrier, message) {
   return await transporter.sendMail(mailOptions);
 }
 
+/**
+ * Send a notification to a Discord channel via Webhook URL
+ */
+async function sendDiscordWebhook(webhookUrl, message) {
+  if (!webhookUrl) {
+    throw new Error("Missing Discord Webhook URL.");
+  }
+
+  const cleanUrl = String(webhookUrl).trim();
+  if (!cleanUrl.startsWith('https://discord.com/api/webhooks/') && !cleanUrl.startsWith('https://discordapp.com/api/webhooks/')) {
+    throw new Error("Invalid Discord Webhook URL. It must start with 'https://discord.com/api/webhooks/'.");
+  }
+
+  // Convert HTML-formatted message to Discord-friendly markdown
+  const discordMsg = message
+    .replace(/<b>(.*?)<\/b>/gi, '**$1**')
+    .replace(/<i>(.*?)<\/i>/gi, '*$1*')
+    .replace(/<[^>]*>/g, '');
+
+  const payload = {
+    username: 'Aether Bot',
+    embeds: [{
+      title: '⚡ Aether Signal',
+      description: discordMsg,
+      color: 0x00D4AA, // Aether teal/cyan
+      timestamp: new Date().toISOString(),
+      footer: { text: 'Aether AI Trading Bot' }
+    }]
+  };
+
+  const response = await fetch(cleanUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Discord Webhook Error (${response.status}): ${errText}`);
+  }
+
+  return { success: true };
+}
+
 module.exports = {
   sendTelegramAlert,
-  sendSMSAlert
+  sendSMSAlert,
+  sendDiscordWebhook
 };
