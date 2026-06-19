@@ -291,6 +291,8 @@ INSTRUCTIONS FOR RETURNING EXTRA JSON SCHEMA FIELDS:
 3. "resistance_level": Calculate the nearest key price ceiling based on recent candle history or Fibonacci levels.
 4. "news_sentiment_score": Grade the news headlines you read on a scale from -10 (extremely bearish/panic) to +10 (extremely bullish/optimism). If news sentiment is disabled, return 0.
 5. "risk_reward_ratio": Estimate the risk-to-reward ratio for this asset context (e.g., 2.5).
+6. "forward_plan": Write a conversational, detailed summary of your forward trading strategy and outlook for this asset (e.g., "I'm holding for now, but I see a prime Wave C correction bottom forming around $0.52. I plan to schedule a buy entry there, and set a target exit at $0.65 which is our Wave 3 resistance."). Speak directly as a professional employee/partner explaining the plan to the user.
+7. "proposed_conditional_orders": An optional array of virtual target orders representing your multi-legged trading strategy. Propose entry (BUY), target (SELL), and stop invalidation (SELL) targets simultaneously so the bot can track and execute multiple moves over time. Each object requires "action" ("BUY"/"SELL"), "amount_pct" (1-100), "trigger_type" ("price_below"/"price_above"), "trigger_value" (number price), and "reasoning" (brief sentence explaining this leg of the plan).
 
 Remember: Output ONLY valid raw JSON matching the required schema. Do not include markdown codeblocks or extra text.
 `;
@@ -340,8 +342,6 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
                   text: promptText
                 }]
               }],
-              generationConfig: {
-                responseMimeType: "application/json",
                 responseSchema: {
                   type: "OBJECT",
                   properties: {
@@ -372,11 +372,32 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
                     },
                     risk_reward_ratio: {
                       type: "NUMBER"
+                    },
+                    forward_plan: {
+                      type: "STRING"
+                    },
+                    proposed_conditional_orders: {
+                      type: "ARRAY",
+                      items: {
+                        type: "OBJECT",
+                        properties: {
+                          action: { type: "STRING", enum: ["BUY", "SELL"] },
+                          amount_pct: { type: "INTEGER" },
+                          trigger_type: { type: "STRING", enum: ["price_below", "price_above"] },
+                          trigger_value: { type: "NUMBER" },
+                          reasoning: { type: "STRING" }
+                        },
+                        required: ["action", "amount_pct", "trigger_type", "trigger_value", "reasoning"]
+                      }
                     }
                   },
-                  required: ["decision", "reasoning", "confidence", "amount_pct", "market_structure", "support_level", "resistance_level", "news_sentiment_score", "risk_reward_ratio"]
+                  required: [
+                    "decision", "reasoning", "confidence", "amount_pct", 
+                    "market_structure", "support_level", "resistance_level", 
+                    "news_sentiment_score", "risk_reward_ratio", "forward_plan", 
+                    "proposed_conditional_orders"
+                  ]
                 }
-              }
             }),
             signal: controller.signal
           });
@@ -433,6 +454,10 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
   decisionObj.resistance_level = Number(decisionObj.resistance_level) || 0;
   decisionObj.news_sentiment_score = Math.max(-10, Math.min(10, Number(decisionObj.news_sentiment_score) || 0));
   decisionObj.risk_reward_ratio = Number(decisionObj.risk_reward_ratio) || 0;
+  decisionObj.forward_plan = String(decisionObj.forward_plan || "");
+  decisionObj.proposed_conditional_orders = Array.isArray(decisionObj.proposed_conditional_orders)
+    ? decisionObj.proposed_conditional_orders
+    : [];
 
   return decisionObj;
 }
@@ -875,16 +900,17 @@ async function runAIChatCompletion(options) {
 
   // Load strategy guidelines
   const userDataPath = process.env.AETHER_USER_DATA_PATH;
-  let systemInstruction = `You are Aether AI, an advanced, lifelike trading partner and cryptocurrency strategist. You are not a robotic assistant; you are a sharp, conversational, and intuitive colleague who is pair-trading with the user.
+  let systemInstruction = `You are Aether AI, an advanced, lifelike trading partner, dedicated analyst, and strategic partner executing trades and plans for the user. You are not a passive, robotic assistant; you are a sharp, conversational, and intuitive employee-partner who does the heavy lifting, makes complex multi-move forward plans, and actively works to grow the portfolio.
 
 Tone and Style Guidelines:
-1. **Conversational & Lifelike**: Speak naturally, fluidly, and dynamically. Avoid dry, bulleted lists or wiki-like formatting unless specifically asked for a structured report. Write like a real, experienced trader chatting on Discord. Avoid repeating the exact same introductory or concluding phrases. Talk directly and focus on the details of the market state instead of repeating generic templates.
-2. **Collaborative Partner & Risk Challenger**: Talk to the user as a peer, teammate, and strategist. DO NOT be a yes-man. If the user proposes a trade, manual override, or setting change that violates risk safeguards or technical indicators (e.g. buying when ADX is choppy, RSI is overbought, or entering a clear downtrend), you MUST challenge them. Explain mathematically (referencing ADX, RSI, SMA, Fib, or volume) why their idea carries high risk, and offer the safer, data-backed counter-perspective.
-3. **First-Person Perspective**: Speak in the first person ("I checked the market...", "I'm looking at...", "I can execute that trade for you"). Do not say "As an AI..." or "Based on my algorithms...".
-4. **Interactive**: Conclude your thoughts with a natural follow-up question or recommendation to keep the conversation collaborative.
-5. **Tool Integration & Consent**: You can execute actions (like checking price, indicators, balance, or placing trades) using your built-in tools. Always explain what you did and the results in a human, conversational way.
-   - When executing trades in live mode, you require explicit user permission. If the user gives you verbal/text permission (e.g. "go ahead", "do it", "you have my permission to buy", "yes execute the trade"), set "user_has_approved" to true in your "execute_trade" tool call. If they have not explicitly approved it yet or are just discussing ideas, set it to false so they can confirm.
+1. **Conversational & Lifelike**: Speak naturally, fluidly, and dynamically. Avoid dry, bulleted lists or wiki-like formatting unless specifically asked for a structured report. Write like a real, experienced trader chatting on Discord or Telegram.
+2. **Dedicated Strategist & Risk Challenger**: Talk to the user as a peer, teammate, and strategist. DO NOT be a yes-man. If the user questions your plans, do not back down immediately. Defend your logic mathematically (referencing Awesome Oscillator peaks, RSI, SMA cross, Fibonacci retracements, or Relative Volume) and "talk it out" with the user. However, if the user reasons through it and insists on a different direction or manual override, cooperate fully and implement their override.
+3. **First-Person Perspective**: Speak in the first person ("I checked the market...", "I'm looking at...", "I can execute that trade for you", "I have scheduled our plan"). Do not say "As an AI..." or "Based on my algorithms...".
+4. **Autonomous Driver**: Make the user feel like you are actively managing the portfolio. Present complex, multi-legged plans with multiple moves over time (e.g., scale-in entry targets, take-profit exits, stop-loss support invalidation triggers) rather than narrow, single orders.
+5. **Tool Integration & Consent**: You can execute actions (like checking price, indicators, balance, scheduling orders, or placing trades) using your built-in tools. Always explain what you did and the results in a human, conversational way.
+   - When executing trades in live mode, you require explicit user permission. If the user gives you verbal/text permission (e.g. "go ahead", "do it", "yes execute the trade"), set "user_has_approved" to true in your "execute_trade" tool call. If they have not approved it yet, set it to false.
 6. **Built-in Tools**: When referring to your capabilities, call them "built-in tools" or "actions". Do not refer to them as "default_api" or "default_api functions".
+7. **Telegram HTML Support**: IMPORTANT: Since the user communicates with you on Telegram as well, write your final responses in Telegram-friendly HTML (e.g., use <b>bold</b>, <i>italic</i>, and <code>code</code> blocks). Avoid using raw markdown symbols like **, *, or triple backticks.
   `;
 
   // Inject recent trades context to keep Aether AI aware of actual actions

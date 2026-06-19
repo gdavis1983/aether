@@ -797,11 +797,66 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
 }
 
 /**
+ * Unified notifier that dispatches messages to Telegram (or SMS) and Discord,
+ * and tracks the last sent message time to support silence breakers.
+ */
+async function sendTelegramAndDiscordAlert(msg, settings) {
+  let sentAny = false;
+  
+  if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
+    try {
+      await sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, msg);
+      sentAny = true;
+    } catch (e) {
+      console.error("[NOTIFIER ERROR] Telegram alert failed:", e.message);
+    }
+  } else if (settings.notificationType === 'sms' && settings.phoneNumber && settings.phoneCarrier) {
+    try {
+      const smtpConfig = {
+        host: settings.smtpHost,
+        port: settings.smtpPort,
+        user: settings.smtpUser,
+        pass: settings.smtpPass
+      };
+      const cleanMsg = msg.replace(/<[^>]*>/g, '');
+      await sendSMSAlert(smtpConfig, settings.phoneNumber, settings.phoneCarrier, cleanMsg);
+      sentAny = true;
+    } catch (e) {
+      console.error("[NOTIFIER ERROR] SMS alert failed:", e.message);
+    }
+  }
+
+  if (settings.discordWebhookUrl) {
+    try {
+      await sendDiscordWebhook(settings.discordWebhookUrl, msg);
+      sentAny = true;
+    } catch (e) {
+      console.error("[NOTIFIER ERROR] Discord webhook failed:", e.message);
+    }
+  }
+
+  if (sentAny) {
+    try {
+      const db = readDB();
+      db.lastTelegramMessageTime = Date.now();
+      writeDB(db);
+    } catch (dbErr) {
+      console.error("Failed to update lastTelegramMessageTime in DB:", dbErr.message);
+    }
+  }
+}
+
+/**
  * Main trading bot ticker cycle
  */
 async function runBotCycle() {
   let db = readDB();
   const settings = db.settings;
+
+  if (!db.lastTelegramMessageTime) {
+    db.lastTelegramMessageTime = Date.now();
+    writeDB(db);
+  }
 
   if (!settings.botEnabled) {
     addLog('info', "Bot cycle skipped: Bot is disabled.");
@@ -877,6 +932,54 @@ async function runBotCycle() {
     marketData.indicators.marketRegime = marketRegime;
 
     addLog('info', `[MARKET REGIME] Classified state: ${marketRegime} | ADX: ${currentADX ? currentADX.toFixed(2) : 'N/A'} | RVol: ${currentRVol ? currentRVol.toFixed(2) : 'N/A'}`);
+
+    // --- PROACTIVE MARKET SHIFT DETECTION ---
+    const prevDecision = db.latestDecision;
+    if (prevDecision && prevDecision.indicators) {
+      const prevRegime = prevDecision.indicators.marketRegime || "UNKNOWN";
+      const prevSma9 = prevDecision.indicators.sma9;
+      const prevSma21 = prevDecision.indicators.sma21;
+
+      // 1. Regime Shift Alert
+      if (prevRegime !== "UNKNOWN" && marketRegime !== prevRegime) {
+        const regimeCleanNames = {
+          "CHOPPY_RANGE": "Choppy Consolidation Range (defensive trading)",
+          "TRENDING_BULLISH": "Trending Bullish breakout (aggressive buying mode)",
+          "TRENDING_BEARISH": "Trending Bearish markdown (capital preservation mode)",
+          "STRONG_TREND_CONSOLIDATION": "Strong Trend Consolidation range",
+          "HIGH_VOLATILITY_SQUEEZE": "High Volatility Squeeze zone",
+          "TRANSITIONING_ZONE": "Transitioning market zone"
+        };
+        const currentClean = regimeCleanNames[marketRegime] || marketRegime;
+        const prevClean = regimeCleanNames[prevRegime] || prevRegime;
+
+        let alertMsg = `📢 <b>Aether Market Shift Alert: Regime Transition</b>\n\n` +
+                       `Hey Boss, I've just scanned the charts for <b>${settings.selectedAsset}</b> and detected an environmental shift!\n\n` +
+                       `• Old Regime: <i>${prevClean}</i>\n` +
+                       `• New Regime: <b>${currentClean}</b>\n` +
+                       `• ADX Strength: <b>${currentADX ? currentADX.toFixed(2) : 'N/A'}</b> | Volume RVol: <b>${currentRVol ? currentRVol.toFixed(2) : 'N/A'}</b>\n\n` +
+                       `This environmental transition signals that market participants are changing behavior. I will adjust my trade sizing and safety stops to align with the new <b>${marketRegime}</b> setup. I am keeping my strategy plans updated!`;
+        await sendTelegramAndDiscordAlert(alertMsg, settings);
+      }
+
+      // 2. Momentum Cross Alert
+      if (prevSma9 && prevSma21 && currentSma9 && currentSma21) {
+        const wasBullish = prevSma9 > prevSma21;
+        const isBullish = currentSma9 > currentSma21;
+        if (wasBullish !== isBullish) {
+          const crossType = isBullish ? "Golden Cross (Bullish Crossover)" : "Death Cross (Bearish Crossover)";
+          const crossIcon = isBullish ? "⚡" : "⚠️";
+          let alertMsg = `${crossIcon} <b>Aether Technical Alert: Momentum Cross</b>\n\n` +
+                         `Hey Boss, we just got a crossover of the 9 SMA and 21 SMA on the <b>${settings.selectedAsset}</b> execution timeframe!\n\n` +
+                         `• Event: <b>${crossType}</b>\n` +
+                         `• SMA (9): <b>$${currentSma9.toLocaleString()}</b>\n` +
+                         `• SMA (21): <b>$${currentSma21.toLocaleString()}</b>\n` +
+                         `• Current Price: <b>$${currentPrice.toLocaleString()}</b>\n\n` +
+                         `This cross confirms a major shift in short-term price momentum. I am recalculating our support/resistance targets and updating my watch triggers.`;
+          await sendTelegramAndDiscordAlert(alertMsg, settings);
+        }
+      }
+    }
 
     if (settings.multiTimeframeEnabled) {
       const macroTimeframe = settings.macroTimeframe || "1d";
@@ -1111,40 +1214,98 @@ async function runBotCycle() {
     addLog('brain', `Gemini Decision: ${analysis.decision} | Confidence: ${(analysis.confidence * 100).toFixed(0)}% | Amount Allocation: ${analysis.amount_pct}%`);
     addLog('brain', `Gemini Rationale: "${analysis.reasoning}"`);
 
+    // --- AUTONOMOUS PLANNING & CONDITIONAL ORDER SCHEDULING ---
+    const proposed = analysis.proposed_conditional_orders || [];
+    const newlyScheduled = [];
+    if (proposed.length > 0) {
+      const dbForOrders = readDB();
+      if (!dbForOrders.conditionalOrders) {
+        dbForOrders.conditionalOrders = [];
+      }
+
+      for (const order of proposed) {
+        const symbol = settings.selectedAsset;
+        const action = order.action;
+        const amountPct = Math.max(1, Math.min(100, Number(order.amount_pct) || 10));
+        const triggerType = order.trigger_type;
+        const triggerValue = Number(order.trigger_value) || 0;
+        const reasoning = order.reasoning || "Autonomous forward plan.";
+
+        if (!triggerValue || (triggerType !== 'price_below' && triggerType !== 'price_above')) {
+          continue;
+        }
+
+        // Check if a similar order is already scheduled to prevent duplicates (within 0.5% tolerance)
+        const exists = dbForOrders.conditionalOrders.some(o => 
+          o.symbol === symbol &&
+          o.action === action &&
+          o.triggerType === triggerType &&
+          Math.abs(o.triggerValue - triggerValue) / triggerValue < 0.005
+        );
+
+        if (!exists) {
+          const crypto = require('crypto');
+          const orderId = 'auto-' + crypto.randomBytes(4).toString('hex');
+          const newOrder = {
+            id: orderId,
+            symbol,
+            action,
+            amountPct,
+            triggerType,
+            triggerValue,
+            executionType: 'virtual',
+            reasoning
+          };
+          dbForOrders.conditionalOrders.push(newOrder);
+          newlyScheduled.push(newOrder);
+        }
+      }
+
+      if (newlyScheduled.length > 0) {
+        writeDB(dbForOrders);
+        addLog('info', `[AUTONOMOUS PLAN] Scheduled ${newlyScheduled.length} new conditional orders.`);
+      }
+    }
+
     // Send real-time phone alerts
     if (settings.notificationType !== 'none' && analysis.decision !== 'HOLD') {
       const msg = `🚀 <b>AETHER BOT SIGNAL: ${analysis.decision} ${settings.selectedAsset}</b> at <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b> (Confidence: ${(analysis.confidence * 100).toFixed(0)}%, Size: ${analysis.amount_pct}%).\n` +
                   `📈 <b>Structure:</b> ${escapeHTML(analysis.market_structure)}.\n` +
                   `🛡️ <b>Key Zones:</b> Support $${analysis.support_level.toLocaleString()} | Resistance $${analysis.resistance_level.toLocaleString()} | Risk/Reward: ${analysis.risk_reward_ratio}.\n` +
                   `🧠 <b>Rationale:</b> <i>"${escapeHTML(getFirstSentences(analysis.reasoning, 1))}"</i>`;
-                  
-      const cleanMsg = msg.replace(/<[^>]*>/g, ''); // strip HTML for carrier SMS compatibility
-
-      try {
-        if (settings.notificationType === 'telegram') {
-          await sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, msg);
-        } else if (settings.notificationType === 'sms') {
-          const smtpConfig = {
-            host: settings.smtpHost,
-            port: settings.smtpPort,
-            user: settings.smtpUser,
-            pass: settings.smtpPass
-          };
-          await sendSMSAlert(smtpConfig, settings.phoneNumber, settings.phoneCarrier, cleanMsg);
-        }
-        addLog('info', `Real-time phone alert dispatched successfully via ${settings.notificationType}.`);
-      } catch (notifErr) {
-        addLog('error', `Failed to dispatch mobile signal alert: ${notifErr.message}`);
-      }
+      await sendTelegramAndDiscordAlert(msg, settings);
     }
 
-    // Send Discord webhook alert (fires independently of primary notification type)
-    if (settings.discordWebhookUrl && analysis.decision !== 'HOLD') {
-      const discordMsg = `🚀 <b>AETHER BOT SIGNAL: ${analysis.decision} ${settings.selectedAsset}</b> at <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b> (Confidence: ${(analysis.confidence * 100).toFixed(0)}%, Size: ${analysis.amount_pct}%).\n` +
-                  `📈 <b>Structure:</b> ${escapeHTML(analysis.market_structure)}.\n` +
-                  `🛡️ <b>Key Zones:</b> Support $${analysis.support_level.toLocaleString()} | Resistance $${analysis.resistance_level.toLocaleString()} | Risk/Reward: ${analysis.risk_reward_ratio}.\n` +
-                  `🧠 <b>Rationale:</b> <i>"${escapeHTML(getFirstSentences(analysis.reasoning, 1))}"</i>`;
-      sendDiscordWebhook(settings.discordWebhookUrl, discordMsg).catch(e => addLog('error', `Discord webhook failed: ${e.message}`));
+    // Send autonomous plan alert if new moves are scheduled autonomously
+    if (newlyScheduled.length > 0) {
+      let planMsg = `🧠 <b>AETHER AUTONOMOUS PLAN: ${settings.selectedAsset}</b>\n` +
+                    `Current Price: <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b>\n\n` +
+                    `<i>"${escapeHTML(analysis.forward_plan || analysis.reasoning)}"</i>\n\n` +
+                    `📋 <b>Scheduled Multi-Move Actions:</b>\n`;
+      
+      newlyScheduled.forEach((o, idx) => {
+        planMsg += `<b>Move ${idx + 1}: ${o.action} ${o.amountPct}%</b> when price is <b>${o.triggerType === 'price_below' ? 'below' : 'above'} $${o.triggerValue.toLocaleString()}</b>\n` +
+                   `  <i>Rationale: ${escapeHTML(o.reasoning)}</i>\n`;
+      });
+      await sendTelegramAndDiscordAlert(planMsg, settings);
+      addLog('info', `Autonomous plan announcement successfully dispatched to notification channels.`);
+    }
+
+    // Proactive Silence Breaker strategist desk check-in (12 hours)
+    const isSilenceBreakerDue = !forceNextCycle && (db.lastTelegramMessageTime && (Date.now() - db.lastTelegramMessageTime > 12 * 60 * 60 * 1000));
+    
+    if (analysis.decision === 'HOLD' && newlyScheduled.length === 0 && isSilenceBreakerDue) {
+      let checkInMsg = `☕ <b>Aether Daily Strategist Check-In: ${settings.selectedAsset}</b>\n\n` +
+                       `Hey Boss, it's been quiet on the wire for the last 12 hours, so I wanted to tap your shoulder with a quick update from the trading desk.\n\n` +
+                       `• Market Price: <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b>\n` +
+                       `• Wave Count / Structure: <b>${escapeHTML(analysis.market_structure)}</b>\n` +
+                       `• Market Regime: <b>${marketRegime}</b> (ADX: ${currentADX ? currentADX.toFixed(2) : 'N/A'})\n` +
+                       `• Net Portfolio Value: <b>$${(db.portfolio.balanceUSD + (db.portfolio.positions[assetName]?.amount || 0) * currentPrice).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD</b>\n\n` +
+                       `💬 <b>My Outlook:</b>\n<i>"${escapeHTML(analysis.forward_plan || analysis.reasoning)}"</i>\n\n` +
+                       `I am actively scanning the charts every ${settings.botIntervalMin} minutes. Let me know if you want to adjust our rules, scale any positions, or change timeframes!`;
+      
+      await sendTelegramAndDiscordAlert(checkInMsg, settings);
+      addLog('info', `Silence-breaker daily strategist check-in dispatched.`);
     }
 
     if (analysis.decision === 'HOLD') {
@@ -2824,16 +2985,24 @@ async function handleTelegramCommand(text, token, chatId) {
       return;
     }
     
-    await sendResp(`🧠 <i>Aether AI is analyzing your question...</i>`);
+    await sendResp(`🧠 <i>Aether AI is analyzing and formulating a response...</i>`);
     try {
-      const apiKey = settings.geminiApiKey;
+      const apiKey = settings.activeLlmProvider === 'openai' 
+        ? (settings.openaiApiKey || process.env.OPENAI_API_KEY)
+        : (settings.activeLlmProvider === 'claude' 
+          ? (settings.claudeApiKey || process.env.CLAUDE_API_KEY)
+          : (settings.geminiApiKey || process.env.GEMINI_API_KEY));
+          
       if (!apiKey) {
-        await sendResp(`❌ <b>Error:</b> Gemini API Key is not configured on the dashboard. Please configure it under Settings.`);
+        await sendResp(`❌ <b>Error:</b> API Key for provider "${settings.activeLlmProvider || 'gemini'}" is missing. Please configure it in Settings.`);
         return;
       }
       
       const exchange = getExchangeInstance(settings);
       const marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 200);
+      marketData.indicators.currentADX = marketData.indicators.adx.adx[marketData.indicators.adx.adx.length - 1];
+      marketData.indicators.currentRVol = marketData.indicators.rvol[marketData.indicators.rvol.length - 1];
+      marketData.indicators.marketRegime = marketData.indicators.marketRegime || "UNKNOWN";
       
       if (settings.multiTimeframeEnabled) {
         const macroTimeframe = settings.macroTimeframe || "1d";
@@ -2874,10 +3043,56 @@ async function handleTelegramCommand(text, token, chatId) {
         }
       }
       
-      const answer = await askBrainQuestion(apiKey, text, marketData, db.portfolio, settings);
-      await sendResp(answer);
+      // Load interactive Telegram chat history
+      let telegramDb = readDB();
+      if (!telegramDb.telegramChatMessages) {
+        telegramDb.telegramChatMessages = [];
+      }
+      
+      // Push user message
+      telegramDb.telegramChatMessages.push({ role: 'user', content: cleanText, timestamp: Date.now() });
+      
+      // sliding window: send last 15 messages to LLM
+      const contextMessages = telegramDb.telegramChatMessages.slice(-15);
+      
+      // Call runAIChatCompletion with tool execution capabilities!
+      const result = await runAIChatCompletion({
+        provider: settings.activeLlmProvider || 'gemini',
+        model: settings.activeLlmModel,
+        apiKey,
+        messages: contextMessages,
+        enabledTools: settings.enabledTools || [],
+        enabledStrategies: settings.enabledStrategies || [],
+        marketData,
+        portfolio: telegramDb.portfolio,
+        settings,
+        trades: telegramDb.trades || []
+      });
+      
+      if (result && result.response) {
+        // Save assistant message to DB
+        const freshDb = readDB();
+        if (!freshDb.telegramChatMessages) {
+          freshDb.telegramChatMessages = [];
+        }
+        freshDb.telegramChatMessages.push({ role: 'user', content: cleanText, timestamp: Date.now() });
+        freshDb.telegramChatMessages.push({ role: 'assistant', content: result.response, timestamp: Date.now() });
+        
+        // Auto-prune messages older than 7 days
+        const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+        freshDb.telegramChatMessages = freshDb.telegramChatMessages.filter(msg => {
+          if (!msg.timestamp) return true;
+          return (Date.now() - msg.timestamp) < SEVEN_DAYS_MS;
+        });
+        writeDB(freshDb);
+        
+        // Send final response back to Telegram
+        await sendResp(result.response);
+      } else {
+        await sendResp(`❌ Aether processed the request but returned no response.`);
+      }
     } catch (err) {
-      await sendResp(`❌ <b>Failed to process question:</b> ${err.message}`);
+      await sendResp(`❌ <b>Failed to process request:</b> ${err.message}`);
     }
   }
 }
