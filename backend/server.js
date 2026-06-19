@@ -98,6 +98,8 @@ let botIntervalId = null;
 let isBotRunning = false;
 let forceNextCycle = false;
 let lastBalanceSyncTime = 0; // Throttle live balance API checks
+let cachedOpenOrders = [];
+let lastOrdersSyncTime = 0;
 let multiTimeframeCache = null;
 let lastMultiTimeframeSync = 0;
 
@@ -268,7 +270,9 @@ function cleanCDPSecret(secret) {
 function getExchangeInstance(settings) {
   const name = settings.exchangeName.toLowerCase();
   if (ccxt[name]) {
-    const config = {};
+    const config = {
+      timeout: 15000 // 15 seconds timeout to prevent indefinite hangs
+    };
     if (settings.exchangeApiKey && settings.exchangeApiSecret) {
       config.apiKey = cleanCDPApiKey(settings.exchangeApiKey);
       config.secret = cleanCDPSecret(settings.exchangeApiSecret);
@@ -280,9 +284,53 @@ function getExchangeInstance(settings) {
     }
     return exchange;
   }
-  const defaultExchange = new ccxt.coinbase();
+
+  const defaultExchange = new ccxt.coinbase({ timeout: 15000 });
   defaultExchange.options['createMarketBuyOrderRequiresPrice'] = false;
   return defaultExchange;
+}
+
+// Sync actual portfolio balance from exchange when in live mode
+async function syncLiveBalance(db, exchange) {
+  if (db.settings.tradingMode === 'live' && db.settings.exchangeApiKey && db.settings.exchangeApiSecret) {
+    try {
+      await exchange.loadMarkets();
+      const balance = await exchange.fetchBalance();
+      
+      const symbol = db.settings.selectedAsset;
+      const assetName = symbol.split('/')[0];
+      const quoteCurrency = symbol.split('/')[1] || 'USD';
+      
+      const freshDb = readDB();
+      freshDb.portfolio.balanceUSD = balance.free[quoteCurrency] || 0;
+      
+      if (!freshDb.portfolio.positions) freshDb.portfolio.positions = {};
+      const holdings = balance.total[assetName] || balance.free[assetName] || 0;
+      if (holdings > 0.00001) {
+        let oldEntry = freshDb.portfolio.positions[assetName]?.avgEntryPrice || 0;
+        if (!oldEntry) {
+          try {
+            const ticker = await exchange.fetchTicker(symbol);
+            oldEntry = ticker.last || ticker.close || 0;
+          } catch (pErr) {
+            console.warn("Could not fetch price for new synced position:", pErr.message);
+          }
+        }
+        freshDb.portfolio.positions[assetName] = {
+          amount: holdings,
+          avgEntryPrice: oldEntry || 0
+        };
+      } else {
+        delete freshDb.portfolio.positions[assetName];
+      }
+      
+      writeDB(freshDb);
+      return freshDb;
+    } catch (err) {
+      console.error("Failed to sync live portfolio balance:", err.message);
+    }
+  }
+  return db;
 }
 
 /**
@@ -752,7 +800,7 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
  * Main trading bot ticker cycle
  */
 async function runBotCycle() {
-  const db = readDB();
+  let db = readDB();
   const settings = db.settings;
 
   if (!settings.botEnabled) {
@@ -776,6 +824,9 @@ async function runBotCycle() {
 
   try {
     const exchange = getExchangeInstance(settings);
+    // Sync balance at start of bot cycle to ensure we use up-to-date portfolio values
+    db = await syncLiveBalance(db, exchange);
+    
     let marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 200);
     const currentPrice = marketData.ticker.close;
 
@@ -1193,50 +1244,31 @@ function getActiveTradeStops(pos, settings, latestDecision, highestPrice) {
 
 // Get bot status and portfolio summary
 app.get('/api/status', async (req, res) => {
-  const db = readDB();
+  let db = readDB();
   
-  // If in live trading mode and keys exist, periodically sync actual balance
+  // If in live trading mode and keys exist, periodically sync actual balance and fetch open orders
+  let openOrders = [];
   if (db.settings.tradingMode === 'live' && db.settings.exchangeApiKey && db.settings.exchangeApiSecret) {
     const now = Date.now();
-    if (now - lastBalanceSyncTime > 30000) { // Throttle: Sync every 30 seconds max
+    const exchange = getExchangeInstance(db.settings);
+    
+    // Sync balance: Throttle every 30s
+    if (now - lastBalanceSyncTime > 30000) {
+      db = await syncLiveBalance(db, exchange);
+      lastBalanceSyncTime = now;
+    }
+    
+    // Fetch open orders: Throttle every 15s
+    if (now - lastOrdersSyncTime > 15000) {
       try {
-        const exchange = getExchangeInstance(db.settings);
-        await exchange.loadMarkets();
-        const balance = await exchange.fetchBalance();
-        
         const symbol = db.settings.selectedAsset;
-        const assetName = symbol.split('/')[0];
-        const quoteCurrency = symbol.split('/')[1] || 'USD';
-        
-        const freshDb = readDB();
-        freshDb.portfolio.balanceUSD = balance.free[quoteCurrency] || 0;
-        
-        if (!freshDb.portfolio.positions) freshDb.portfolio.positions = {};
-        const holdings = balance.total[assetName] || balance.free[assetName] || 0;
-        if (holdings > 0.00001) {
-          let oldEntry = freshDb.portfolio.positions[assetName]?.avgEntryPrice || 0;
-          if (!oldEntry) {
-            try {
-              const ticker = await exchange.fetchTicker(symbol);
-              oldEntry = ticker.last || ticker.close || 0;
-            } catch (pErr) {
-              console.warn("Could not fetch price for new synced position:", pErr.message);
-            }
-          }
-          freshDb.portfolio.positions[assetName] = {
-            amount: holdings,
-            avgEntryPrice: oldEntry || 0
-          };
-        } else {
-          delete freshDb.portfolio.positions[assetName];
-        }
-        
-        writeDB(freshDb);
-        lastBalanceSyncTime = now;
+        cachedOpenOrders = await exchange.fetchOpenOrders(symbol);
+        lastOrdersSyncTime = now;
       } catch (err) {
-        console.error("Failed to sync live portfolio balance:", err.message);
+        console.error("Failed to fetch Coinbase open orders for status:", err.message);
       }
     }
+    openOrders = cachedOpenOrders;
   }
 
   const finalDb = readDB();
@@ -1251,6 +1283,8 @@ app.get('/api/status', async (req, res) => {
     highestPriceReached: finalDb.highestPriceReached || {},
     latestDecision: finalDb.latestDecision || null,
     activeTradeStops,
+    conditionalOrders: finalDb.conditionalOrders || [],
+    openOrders: openOrders,
     settings: {
       ...finalDb.settings,
       geminiApiKey: finalDb.settings.geminiApiKey ? '••••••••' : '',
@@ -1725,26 +1759,75 @@ app.get('/api/market/multi-indicators', async (req, res) => {
   }
 });
 
+// Helper to fetch any number of candles by paginating in parallel
+async function fetchOHLCVWithLimit(exchange, symbol, timeframe, limit, beforeMs) {
+  const maxSingleLimit = 300; // Coinbase API limit per request
+  const tfMs = getTimeframeMs(timeframe);
+  const endMs = beforeMs || Date.now();
+  
+  // Calculate total number of candles needed from the source timeframe
+  const totalNeeded = limit;
+  const numBatches = Math.ceil(totalNeeded / maxSingleLimit);
+  
+  const promises = [];
+  for (let i = 0; i < numBatches; i++) {
+    // Each batch ends i * maxSingleLimit candles before endMs
+    const batchEndMs = endMs - (i * maxSingleLimit * tfMs);
+    const sinceMs = batchEndMs - (maxSingleLimit * tfMs);
+    
+    promises.push(
+      exchange.fetchOHLCV(symbol, timeframe, sinceMs, maxSingleLimit)
+        .catch(e => {
+          console.warn(`[API] Failed to fetch batch ${i} for ${symbol} (${timeframe}):`, e.message);
+          return [];
+        })
+    );
+  }
+  
+  const results = await Promise.all(promises);
+  const allCandles = [];
+  const seen = new Set();
+  
+  results.flat().forEach(c => {
+    if (c && c[0] && !seen.has(c[0])) {
+      seen.add(c[0]);
+      allCandles.push(c);
+    }
+  });
+  
+  allCandles.sort((a, b) => a[0] - b[0]);
+  return allCandles.slice(-totalNeeded);
+}
+
 // Fetch candles (for the UI chart)
 app.get('/api/market/candles', async (req, res) => {
-  const { symbol, timeframe, limit } = req.query;
+  const { symbol, timeframe, limit, before } = req.query;
   const db = readDB();
   try {
     const exchange = getExchangeInstance(db.settings);
     const limitNum = Number(limit) || 100;
+    const beforeMs = before ? Number(before) * 1000 : undefined;
     
     let candlesRaw;
     if (timeframe === '4h') {
-      const raw1h = await exchange.fetchOHLCV(symbol || 'BTC/USD', '1h', undefined, limitNum * 4 + 4);
+      // For 4h, we need limitNum * 4 1h candles
+      const raw1h = await fetchOHLCVWithLimit(exchange, symbol || 'BTC/USD', '1h', limitNum * 4 + 4, beforeMs);
       candlesRaw = aggregateCandles(raw1h, 4);
       if (candlesRaw.length > limitNum) {
         candlesRaw = candlesRaw.slice(-limitNum);
       }
     } else {
-      candlesRaw = await exchange.fetchOHLCV(symbol || 'BTC/USD', timeframe || '1h', undefined, limitNum);
+      candlesRaw = await fetchOHLCVWithLimit(exchange, symbol || 'BTC/USD', timeframe || '1h', limitNum, beforeMs);
     }
+
+    // If `before` was specified, exclude candles at or after that timestamp
+    if (before) {
+      const beforeMsValue = Number(before) * 1000;
+      candlesRaw = candlesRaw.filter(c => c[0] < beforeMsValue);
+    }
+
     const candles = candlesRaw.map(c => ({
-      time: c[0] / 1000, // lightweight-charts expects seconds for unix time
+      time: c[0] / 1000,
       open: c[1],
       high: c[2],
       low: c[3],
@@ -1756,6 +1839,12 @@ app.get('/api/market/candles', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Helper: convert timeframe string to milliseconds
+function getTimeframeMs(tf) {
+  const map = { '1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '4h': 14400000, '6h': 21600000, '12h': 43200000, '1d': 86400000, '1w': 604800000 };
+  return map[tf] || 3600000;
+}
 
 // ----------------------------------------------------
 // CUSTOM TOOLS & PLUGINS APIs

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   TrendingUp, 
   Cpu, 
@@ -307,304 +307,362 @@ function TradingViewWidget({ symbol }) {
   );
 }
 
-// Custom Canvas Candlestick Chart component
-function CustomTradingChart({ candleData, symbol }) {
-  const canvasRef = useRef(null);
-  const containerRef = useRef(null);
-  const [hoverIndex, setHoverIndex] = useState(null);
-  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
-  const [isHovering, setIsHovering] = useState(false);
+// Custom Canvas Candlestick Chart component — supports zoom (wheel), pan (drag), history load (scroll left), reset (dbl-click)
+function CustomTradingChart({ candleData, setCandleData, symbol, selectedAsset, selectedTimeframe, backendUrl }) {
+  const chartContainerRef = useRef(null);
+  const chartRef = useRef(null);
+  const candlestickSeriesRef = useRef(null);
+  const sma9SeriesRef = useRef(null);
+  const sma21SeriesRef = useRef(null);
+  const loadingMoreRef = useRef(false);
+  const [legendInfo, setLegendInfo] = useState(null);
 
+  const fetchOlderCandles = useCallback(async () => {
+    if (loadingMoreRef.current || !candleData || candleData.length === 0) return;
+    loadingMoreRef.current = true;
+    try {
+      const oldest = candleData[0].time;
+      const url = `${backendUrl}/api/market/candles?symbol=${encodeURIComponent(selectedAsset)}&timeframe=${selectedTimeframe}&limit=300&before=${oldest}`;
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const older = await res.json();
+      if (Array.isArray(older) && older.length > 0) {
+        setCandleData(prev => {
+          const existing = new Set(prev.map(c => c.time));
+          const fresh = [];
+          const seen = new Set();
+          older.forEach(c => {
+            if (!existing.has(c.time) && !seen.has(c.time)) {
+              fresh.push(c);
+              seen.add(c.time);
+            }
+          });
+          if (fresh.length === 0) return prev;
+          return [...fresh, ...prev];
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to fetch older candles:', e);
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [candleData, selectedAsset, selectedTimeframe, backendUrl, setCandleData]);
+
+  // Handle initialization and window resize
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    if (!chartContainerRef.current) return;
 
-    const handleResize = () => {
-      if (!canvas || !containerRef.current) return;
-      const rect = containerRef.current.getBoundingClientRect();
-      
-      // Support Retina screens
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      canvas.style.width = '100%';
-      canvas.style.height = '100%';
-      
-      ctx.resetTransform();
-      ctx.scale(dpr, dpr);
-      
-      drawChart(rect.width, rect.height);
-    };
+    // Create the chart
+    const chart = createChart(chartContainerRef.current, {
+      width: chartContainerRef.current.clientWidth,
+      height: 350,
+      layout: {
+        background: { type: 'solid', color: 'transparent' },
+        textColor: '#d1d5db',
+        fontFamily: '"JetBrains Mono", monospace',
+        attributionLogo: false,
+      },
+      grid: {
+        vertLines: { visible: false },
+        horzLines: { color: 'rgba(255, 255, 255, 0.02)' },
+      },
+      rightPriceScale: {
+        borderColor: 'rgba(255, 255, 255, 0.08)',
+      },
+      timeScale: {
+        borderColor: 'rgba(255, 255, 255, 0.08)',
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      crosshair: {
+        mode: 1, // Magnet mode
+        vertLine: {
+          color: 'rgba(255, 255, 255, 0.2)',
+          width: 1,
+          style: 3, // Dashed
+        },
+        horzLine: {
+          color: 'rgba(255, 255, 255, 0.2)',
+          width: 1,
+          style: 3, // Dashed
+        },
+      },
+    });
 
-    const drawChart = (width, height) => {
-      ctx.clearRect(0, 0, width, height);
+    // Add series
+    const candlestickSeries = chart.addSeries(CandlestickSeries, {
+      upColor: 'rgba(255, 255, 255, 0.08)',
+      downColor: '#333333',
+      borderVisible: true,
+      borderUpColor: '#ffffff',
+      borderDownColor: '#555555',
+      wickUpColor: '#ffffff',
+      wickDownColor: '#555555',
+    });
 
-      if (!candleData || candleData.length === 0) {
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '11px "JetBrains Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('NO MARKET DATA LOADED', width / 2, height / 2);
+    const sma9Series = chart.addSeries(LineSeries, {
+      color: 'rgba(255, 255, 255, 0.6)',
+      lineWidth: 1.2,
+      priceLineVisible: false,
+    });
+
+    const sma21Series = chart.addSeries(LineSeries, {
+      color: 'rgba(255, 255, 255, 0.25)',
+      lineWidth: 1.2,
+      priceLineVisible: false,
+    });
+
+    chartRef.current = chart;
+    candlestickSeriesRef.current = candlestickSeries;
+    sma9SeriesRef.current = sma9Series;
+    sma21SeriesRef.current = sma21Series;
+
+    // Handle crosshair hover movement to update legend info
+    chart.subscribeCrosshairMove((param) => {
+      if (
+        param === null ||
+        param.time === null ||
+        param.point === null ||
+        !param.seriesData.has(candlestickSeries)
+      ) {
+        setLegendInfo(null);
         return;
       }
+      
+      const data = param.seriesData.get(candlestickSeries);
+      const sma9Val = param.seriesData.get(sma9Series);
+      const sma21Val = param.seriesData.get(sma21Series);
+      
+      const dateObj = new Date(Number(param.time) * 1000);
+      const dateStr = isNaN(dateObj.getTime())
+        ? 'N/A'
+        : dateObj.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
-      // Price bounds
-      let maxPrice = -Infinity;
-      let minPrice = Infinity;
-      candleData.forEach(c => {
-        if (c.high > maxPrice) maxPrice = c.high;
-        if (c.low < minPrice) minPrice = c.low;
+      setLegendInfo({
+        time: dateStr,
+        open: data.open,
+        high: data.high,
+        low: data.low,
+        close: data.close,
+        volume: data.volume || 0,
+        sma9: sma9Val ? sma9Val.value : null,
+        sma21: sma21Val ? sma21Val.value : null,
       });
+    });
 
-      // Extra spacing top/bottom
-      const priceDiff = maxPrice - minPrice || 1;
-      maxPrice += priceDiff * 0.08;
-      minPrice -= priceDiff * 0.08;
-
-      // SMAs
-      const sma9 = [];
-      const sma21 = [];
-      for (let i = 0; i < candleData.length; i++) {
-        if (i >= 8) {
-          const sum = candleData.slice(i - 8, i + 1).reduce((acc, c) => acc + c.close, 0);
-          sma9.push({ idx: i, val: sum / 9 });
-        }
-        if (i >= 20) {
-          const sum = candleData.slice(i - 20, i + 1).reduce((acc, c) => acc + c.close, 0);
-          sma21.push({ idx: i, val: sum / 21 });
-        }
-      }
-
-      const paddingRight = 65;
-      const paddingTop = 25;
-      const paddingBottom = 20;
-      const chartWidth = width - paddingRight - 15;
-      const chartHeight = height - paddingTop - paddingBottom;
-
-      const getX = (idx) => 10 + (idx / (candleData.length - 1)) * chartWidth;
-      const getY = (val) => paddingTop + (1 - (val - minPrice) / (maxPrice - minPrice)) * chartHeight;
-
-      // Draw gridlines (Horizontal price lines)
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.02)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-
-      const gridCount = 5;
-      for (let i = 0; i < gridCount; i++) {
-        const priceVal = minPrice + (i / (gridCount - 1)) * (maxPrice - minPrice);
-        const y = getY(priceVal);
-        ctx.beginPath();
-        ctx.moveTo(10, y);
-        ctx.lineTo(width - paddingRight, y);
-        ctx.stroke();
-
-        // Label
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '8px "JetBrains Mono", monospace';
-        ctx.textAlign = 'left';
-        ctx.setLineDash([]);
-        ctx.fillText(priceVal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), width - paddingRight + 5, y + 3);
-        ctx.setLineDash([4, 4]);
-      }
-      ctx.setLineDash([]);
-
-      // Draw candlesticks
-      const candleWidth = Math.max(2, (chartWidth / candleData.length) * 0.7);
-
-      candleData.forEach((c, idx) => {
-        const x = getX(idx);
-        const yHigh = getY(c.high);
-        const yLow = getY(c.low);
-        const yOpen = getY(c.open);
-        const yClose = getY(c.close);
-
-        const isUp = c.close >= c.open;
-        const color = isUp ? '#FFFFFF' : '#555555';
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1;
-
-        // Wick
-        ctx.beginPath();
-        ctx.moveTo(x, yHigh);
-        ctx.lineTo(x, yLow);
-        ctx.stroke();
-
-        // Body
-        ctx.fillStyle = isUp ? 'rgba(255, 255, 255, 0.08)' : '#333333';
-        const bodyH = Math.max(1, Math.abs(yClose - yOpen));
-        const bodyY = Math.min(yOpen, yClose);
-
-        ctx.fillRect(x - candleWidth / 2, bodyY, candleWidth, bodyH);
-        ctx.strokeRect(x - candleWidth / 2, bodyY, candleWidth, bodyH);
-      });
-
-      // Plot SMA 9
-      if (sma9.length > 0) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'; // Thin White
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        sma9.forEach((pt, sIdx) => {
-          const x = getX(pt.idx);
-          const y = getY(pt.val);
-          if (sIdx === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+    // Handle auto-resize
+    const handleResize = () => {
+      if (chartContainerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({
+          width: chartContainerRef.current.clientWidth,
         });
-        ctx.stroke();
       }
+    };
+    window.addEventListener('resize', handleResize);
 
-      // Plot SMA 21
-      if (sma21.length > 0) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)'; // Thin White SMA 21
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        sma21.forEach((pt, sIdx) => {
-          const x = getX(pt.idx);
-          const y = getY(pt.val);
-          if (sIdx === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+    // Support middle-mouse button dragging (scroll wheel click & drag) to pan
+    const container = chartContainerRef.current;
+    let isMiddleDragging = false;
+    let dragTarget = null;
+
+    const handleMouseDown = (e) => {
+      if (e.button === 1) { // Middle mouse click
+        e.preventDefault();
+        e.stopPropagation();
+        isMiddleDragging = true;
+        dragTarget = e.target;
+        
+        const fakeEvent = new MouseEvent('mousedown', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 1,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
         });
-        ctx.stroke();
-      }
-
-      // Draw crosshair details
-      if (isHovering && hoverIndex !== null && hoverIndex >= 0 && hoverIndex < candleData.length) {
-        const c = candleData[hoverIndex];
-        const hX = getX(hoverIndex);
-
-        // Vertical line
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(hX, paddingTop);
-        ctx.lineTo(hX, height - paddingBottom);
-        ctx.stroke();
-
-        // Horizontal line
-        if (mousePos.y >= paddingTop && mousePos.y <= height - paddingBottom) {
-          ctx.beginPath();
-          ctx.moveTo(10, mousePos.y);
-          ctx.lineTo(width - paddingRight, mousePos.y);
-          ctx.stroke();
-
-          // Price label box
-          const hoverPrice = maxPrice - ((mousePos.y - paddingTop) / chartHeight) * (maxPrice - minPrice);
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fillRect(width - paddingRight + 2, mousePos.y - 7, 58, 14);
-          ctx.fillStyle = '#000000';
-          ctx.font = 'bold 8px "JetBrains Mono", monospace';
-          ctx.fillText(hoverPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), width - paddingRight + 5, mousePos.y + 3);
-        }
-
-        // Top information bar
-        ctx.fillStyle = 'rgba(26, 26, 26, 0.95)';
-        ctx.fillRect(10, 2, width - 20, 18);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '8.5px "JetBrains Mono", monospace';
-        ctx.textAlign = 'left';
-
-        let timeStr = 'N/A';
-        if (c && c.time) {
-          const d = new Date(c.time * 1000);
-          if (!isNaN(d.getTime())) {
-            timeStr = d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-          }
-        }
-        ctx.fillText(`${timeStr} | O:`, 12, 14);
-        
-        ctx.fillStyle = '#fff';
-        let offset = 12 + ctx.measureText(`${timeStr} | O:`).width;
-        ctx.fillText(c.open.toFixed(2), offset, 14);
-
-        ctx.fillStyle = '#ffffff';
-        offset += ctx.measureText(c.open.toFixed(2)).width + 6;
-        ctx.fillText('H:', offset, 14);
-        
-        ctx.fillStyle = '#fff';
-        offset += ctx.measureText('H:').width;
-        ctx.fillText(c.high.toFixed(2), offset, 14);
-
-        ctx.fillStyle = '#ffffff';
-        offset += ctx.measureText(c.high.toFixed(2)).width + 6;
-        ctx.fillText('L:', offset, 14);
-        
-        ctx.fillStyle = '#fff';
-        offset += ctx.measureText('L:').width;
-        ctx.fillText(c.low.toFixed(2), offset, 14);
-
-        ctx.fillStyle = '#ffffff';
-        offset += ctx.measureText(c.low.toFixed(2)).width + 6;
-        ctx.fillText('C:', offset, 14);
-        
-        ctx.fillStyle = c.close >= c.open ? '#FFFFFF' : '#666666';
-        offset += ctx.measureText('C:').width;
-        ctx.fillText(c.close.toFixed(2), offset, 14);
-
-        ctx.fillStyle = '#ffffff';
-        offset += ctx.measureText(c.close.toFixed(2)).width + 6;
-        ctx.fillText('V:', offset, 14);
-        
-        ctx.fillStyle = '#fff';
-        offset += ctx.measureText('V:').width;
-        ctx.fillText(c.volume.toFixed(0), offset, 14);
-      } else {
-        // Default top HUD status
-        const latest = candleData[candleData.length - 1];
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '8px "JetBrains Mono", monospace';
-        ctx.textAlign = 'left';
-        ctx.fillText(`ASSET: ${symbol} | IND: SMA(9) [White] | SMA(21) [Orange] | PRICE: $${latest.close.toFixed(2)}`, 12, 14);
+        dragTarget.dispatchEvent(fakeEvent);
       }
     };
 
-    // Initialize resize observer
-    const resizeObserver = new ResizeObserver(() => {
-      handleResize();
-    });
-    if (containerRef.current) {
-      resizeObserver.observe(containerRef.current);
-    }
+    const handleMouseMove = (e) => {
+      if (isMiddleDragging && dragTarget) {
+        e.preventDefault();
+        const fakeEvent = new MouseEvent('mousemove', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 1,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
+        });
+        dragTarget.dispatchEvent(fakeEvent);
+      }
+    };
 
-    handleResize();
+    const handleMouseUp = (e) => {
+      if (e.button === 1 && isMiddleDragging && dragTarget) {
+        e.preventDefault();
+        e.stopPropagation();
+        isMiddleDragging = false;
+        
+        const fakeEvent = new MouseEvent('mouseup', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 0,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
+        });
+        dragTarget.dispatchEvent(fakeEvent);
+        dragTarget = null;
+      }
+    };
+
+    const handleScrollClick = (e) => {
+      if (e.button === 1) {
+        e.preventDefault();
+      }
+    };
+
+    if (container) {
+      container.addEventListener('mousedown', handleMouseDown, true);
+      container.addEventListener('click', handleScrollClick, true);
+    }
+    window.addEventListener('mousemove', handleMouseMove, { capture: true, passive: false });
+    window.addEventListener('mouseup', handleMouseUp, true);
 
     return () => {
-      resizeObserver.disconnect();
+      window.removeEventListener('resize', handleResize);
+      if (container) {
+        container.removeEventListener('mousedown', handleMouseDown, true);
+        container.removeEventListener('click', handleScrollClick, true);
+      }
+      window.removeEventListener('mousemove', handleMouseMove, true);
+      window.removeEventListener('mouseup', handleMouseUp, true);
+      chart.remove();
     };
-  }, [candleData, hoverIndex, mousePos, isHovering, symbol]);
+  }, []);
 
-  const handleMouseMove = (e) => {
-    const canvas = canvasRef.current;
-    if (!canvas || !candleData || candleData.length === 0) return;
+  // Sync scroll left boundary to trigger lazy history load
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
 
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const handleVisibleLogicalRangeChange = (newRange) => {
+      if (newRange === null) return;
+      // When scrolling close to the left edge (e.g., logical range starts before index 10)
+      if (newRange.from < 10 && !loadingMoreRef.current) {
+        fetchOlderCandles();
+      }
+    };
 
-    const paddingRight = 65;
-    const chartWidth = rect.width - paddingRight - 15;
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleLogicalRangeChange);
+    return () => {
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleLogicalRangeChange);
+    };
+  }, [fetchOlderCandles]);
 
-    const relX = x - 10;
-    const pct = relX / chartWidth;
-    let idx = Math.round(pct * (candleData.length - 1));
-    idx = Math.max(0, Math.min(candleData.length - 1, idx));
+  // Sync data updates
+  useEffect(() => {
+    if (!candlestickSeriesRef.current || !sma9SeriesRef.current || !sma21SeriesRef.current || !candleData || candleData.length === 0) return;
 
-    setHoverIndex(idx);
-    setMousePos({ x, y });
-    setIsHovering(true);
-  };
+    // Sort to be chronologically ordered and filter unique timestamps
+    const prevMap = new Map();
+    candleData.forEach(c => prevMap.set(c.time, c));
+    const sortedUniqueCandles = Array.from(prevMap.values()).sort((a, b) => a.time - b.time);
 
-  const handleMouseLeave = () => {
-    setIsHovering(false);
-    setHoverIndex(null);
-  };
+    const formattedCandles = sortedUniqueCandles.map(c => ({
+      time: c.time,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }));
+
+    const sma9Data = [];
+    const sma21Data = [];
+    for (let i = 0; i < sortedUniqueCandles.length; i++) {
+      if (i >= 8) {
+        const sum = sortedUniqueCandles.slice(i - 8, i + 1).reduce((acc, c) => acc + c.close, 0);
+        sma9Data.push({ time: sortedUniqueCandles[i].time, value: sum / 9 });
+      }
+      if (i >= 20) {
+        const sum = sortedUniqueCandles.slice(i - 20, i + 1).reduce((acc, c) => acc + c.close, 0);
+        sma21Data.push({ time: sortedUniqueCandles[i].time, value: sum / 21 });
+      }
+    }
+
+    candlestickSeriesRef.current.setData(formattedCandles);
+    sma9SeriesRef.current.setData(sma9Data);
+    sma21SeriesRef.current.setData(sma21Data);
+
+  }, [candleData]);
+
+  // Get current last candle price for default legend display
+  const lastCandle = candleData && candleData.length > 0 ? candleData[candleData.length - 1] : null;
 
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', minHeight: '180px', position: 'relative' }}>
-      <canvas
-        ref={canvasRef}
-        style={{ width: '100%', height: '100%', display: 'block', background: 'transparent' }}
-        onMouseMove={handleMouseMove}
-        onMouseLeave={handleMouseLeave}
-      />
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      {/* Chart Legend Overlay */}
+      <div style={{
+        position: 'absolute',
+        top: 8,
+        left: 12,
+        zIndex: 10,
+        fontFamily: '"JetBrains Mono", monospace',
+        fontSize: '0.66rem',
+        color: '#9ca3af',
+        backgroundColor: 'rgba(12, 13, 15, 0.85)',
+        padding: '4px 8px',
+        borderRadius: '4px',
+        border: '1px solid rgba(255, 255, 255, 0.05)',
+        pointerEvents: 'none',
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '8px',
+        maxWidth: '90%'
+      }}>
+        {legendInfo ? (
+          <>
+            <span style={{ color: '#fff', fontWeight: 'bold' }}>{legendInfo.time}</span>
+            <span>O:<span style={{ color: '#fff', marginLeft: 2 }}>{legendInfo.open.toFixed(2)}</span></span>
+            <span>H:<span style={{ color: '#fff', marginLeft: 2 }}>{legendInfo.high.toFixed(2)}</span></span>
+            <span>L:<span style={{ color: '#fff', marginLeft: 2 }}>{legendInfo.low.toFixed(2)}</span></span>
+            <span>C:<span style={{ color: legendInfo.close >= legendInfo.open ? '#10b981' : '#ef4444', marginLeft: 2 }}>{legendInfo.close.toFixed(2)}</span></span>
+            {legendInfo.sma9 && (
+              <span>SMA9:<span style={{ color: 'rgba(255,255,255,0.8)', marginLeft: 2 }}>{legendInfo.sma9.toFixed(2)}</span></span>
+            )}
+            {legendInfo.sma21 && (
+              <span>SMA21:<span style={{ color: 'rgba(255,255,255,0.4)', marginLeft: 2 }}>{legendInfo.sma21.toFixed(2)}</span></span>
+            )}
+          </>
+        ) : (
+          <>
+            <span style={{ color: '#fff', fontWeight: 'bold' }}>ASSET: {symbol}</span>
+            {lastCandle && (
+              <>
+                <span>PRICE:<span style={{ color: '#fff', marginLeft: 2 }}>${lastCandle.close.toFixed(2)}</span></span>
+                <span>SMA(9) [White]</span>
+                <span>SMA(21) [Dim]</span>
+              </>
+            )}
+          </>
+        )}
+        {loadingMoreRef.current && (
+          <span style={{ color: 'var(--term-accent-cyan)', fontWeight: 'bold', marginLeft: 'auto' }}>LOADING HISTORY...</span>
+        )}
+      </div>
+
+      <div ref={chartContainerRef} style={{ width: '100%', height: '350px' }} />
     </div>
   );
 }
@@ -1005,6 +1063,7 @@ export default function App() {
   const btChartContainerRef = useRef(null);
   const chatScrollRef = useRef(null);
   const chatInputRef = useRef(null);
+  const isInitialLogsLoaded = useRef(false);
   const [thinkingStep, setThinkingStep] = useState(0);
   const [chatAutoScroll, setChatAutoScroll] = useState(true);
 
@@ -1112,21 +1171,57 @@ export default function App() {
 
   // Scroll to bottom of logs on tab changes
   useEffect(() => {
-    const terminals = document.querySelectorAll('.log-terminal');
-    terminals.forEach(term => {
-      term.scrollTop = term.scrollHeight;
-    });
+    const scrollAll = () => {
+      const terminals = document.querySelectorAll('.log-terminal');
+      terminals.forEach(term => {
+        term.scrollTop = term.scrollHeight;
+      });
+    };
+    // Use staggered timeouts to guarantee scrolling after DOM update and browser layout calculations
+    setTimeout(scrollAll, 50);
+    setTimeout(scrollAll, 200);
   }, [activeTab, dashboardSubTab]);
 
-  // Handle auto-scroll on new logs only if already near bottom
+  // Scroll to bottom of logs on initial load completion (transition from loading screen to dashboard)
   useEffect(() => {
-    const terminals = document.querySelectorAll('.log-terminal');
-    terminals.forEach(term => {
-      const isNearBottom = term.scrollHeight - term.scrollTop - term.clientHeight <= 50;
-      if (isNearBottom) {
-        term.scrollTop = term.scrollHeight;
+    if (!loading) {
+      const scrollAll = () => {
+        const terminals = document.querySelectorAll('.log-terminal');
+        terminals.forEach(term => {
+          term.scrollTop = term.scrollHeight;
+        });
+      };
+      setTimeout(scrollAll, 50);
+      setTimeout(scrollAll, 250);
+      setTimeout(scrollAll, 600);
+    }
+  }, [loading]);
+
+  // Handle auto-scroll on new logs (scrolls on initial load, or if already near bottom)
+  useEffect(() => {
+    if (logs.length > 0) {
+      const terminals = document.querySelectorAll('.log-terminal');
+      
+      const scrollAll = () => {
+        terminals.forEach(term => {
+          term.scrollTop = term.scrollHeight;
+        });
+      };
+
+      if (!isInitialLogsLoaded.current) {
+        isInitialLogsLoaded.current = true;
+        setTimeout(scrollAll, 50);
+        setTimeout(scrollAll, 250);
+        setTimeout(scrollAll, 600);
+      } else {
+        terminals.forEach(term => {
+          const isNearBottom = term.scrollHeight - term.scrollTop - term.clientHeight <= 150;
+          if (isNearBottom) {
+            term.scrollTop = term.scrollHeight;
+          }
+        });
       }
-    });
+    }
   }, [logs]);
 
   // Fetch latest price data for manual trade calculations
@@ -1137,13 +1232,18 @@ export default function App() {
     const loadPriceData = async () => {
       setChartLoading(true);
       try {
-        const res = await fetch(`${BACKEND_URL}/api/market/candles?symbol=${status.settings.selectedAsset}&timeframe=${status.settings.selectedTimeframe}&limit=200`);
+        const res = await fetch(`${BACKEND_URL}/api/market/candles?symbol=${status.settings.selectedAsset}&timeframe=${status.settings.selectedTimeframe}&limit=600`);
         const data = await res.json();
         
         if (!isMounted) return;
         
         if (res.ok && Array.isArray(data)) {
-          setCandleData(data);
+          setCandleData(prev => {
+            if (!prev || prev.length === 0) return data;
+            const prevMap = new Map(prev.map(c => [c.time, c]));
+            data.forEach(c => prevMap.set(c.time, c));
+            return Array.from(prevMap.values()).sort((a, b) => a.time - b.time);
+          });
         }
       } catch (err) {
         console.error("Failed to load price tick:", err);
@@ -1173,6 +1273,7 @@ export default function App() {
       layout: {
         background: { color: 'rgba(17, 24, 39, 0.45)' },
         textColor: '#d1d5db',
+        attributionLogo: false,
       },
       grid: {
         vertLines: { color: 'rgba(255, 255, 255, 0.05)' },
@@ -1230,8 +1331,94 @@ export default function App() {
     };
     window.addEventListener('resize', handleResize);
 
+    // Support middle-mouse button dragging (scroll wheel click & drag) to pan
+    const container = btChartContainerRef.current;
+    let isMiddleDragging = false;
+    let dragTarget = null;
+
+    const handleMouseDown = (e) => {
+      if (e.button === 1) { // Middle mouse click
+        e.preventDefault();
+        e.stopPropagation();
+        isMiddleDragging = true;
+        dragTarget = e.target;
+        
+        const fakeEvent = new MouseEvent('mousedown', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 1,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
+        });
+        dragTarget.dispatchEvent(fakeEvent);
+      }
+    };
+
+    const handleMouseMove = (e) => {
+      if (isMiddleDragging && dragTarget) {
+        e.preventDefault();
+        const fakeEvent = new MouseEvent('mousemove', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 1,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
+        });
+        dragTarget.dispatchEvent(fakeEvent);
+      }
+    };
+
+    const handleMouseUp = (e) => {
+      if (e.button === 1 && isMiddleDragging && dragTarget) {
+        e.preventDefault();
+        e.stopPropagation();
+        isMiddleDragging = false;
+        
+        const fakeEvent = new MouseEvent('mouseup', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 0,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          screenX: e.screenX,
+          screenY: e.screenY,
+        });
+        dragTarget.dispatchEvent(fakeEvent);
+        dragTarget = null;
+      }
+    };
+
+    const handleScrollClick = (e) => {
+      if (e.button === 1) {
+        e.preventDefault();
+      }
+    };
+
+    if (container) {
+      container.addEventListener('mousedown', handleMouseDown, true);
+      container.addEventListener('click', handleScrollClick, true);
+    }
+    window.addEventListener('mousemove', handleMouseMove, { capture: true, passive: false });
+    window.addEventListener('mouseup', handleMouseUp, true);
+
     return () => {
       window.removeEventListener('resize', handleResize);
+      if (container) {
+        container.removeEventListener('mousedown', handleMouseDown, true);
+        container.removeEventListener('click', handleScrollClick, true);
+      }
+      window.removeEventListener('mousemove', handleMouseMove, true);
+      window.removeEventListener('mouseup', handleMouseUp, true);
       chart.remove();
     };
   }, [activeTab, backtestResults]);
@@ -1930,6 +2117,99 @@ export default function App() {
                       <span style={{ fontSize: '0.64rem', color: 'var(--term-text-secondary)' }}>Monitoring markets for Elliott Wave patterns and momentum triggers.</span>
                     </div>
                   )}
+
+                  {/* Open Orders Section (Both Coinbase and Aether) */}
+                  <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '8px', marginTop: '8px' }}>
+                    <span style={{ fontSize: '0.58rem', textTransform: 'uppercase', color: 'var(--term-text-secondary)', fontWeight: 'bold', display: 'block', marginBottom: '4px' }}>
+                      OPEN ORDERS (COINBASE & AETHER)
+                    </span>
+                    
+                    {(() => {
+                      const cbOpenOrders = status?.openOrders || [];
+                      const aetherCondOrders = status?.conditionalOrders || [];
+                      
+                      const allOrders = [
+                        ...cbOpenOrders.map(o => ({
+                          id: o.id,
+                          source: 'Coinbase',
+                          action: o.side.toUpperCase(),
+                          price: o.price,
+                          amount: o.amount,
+                          symbol: o.symbol,
+                          type: 'limit',
+                          details: `Limit Order @ $${o.price.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+                        })),
+                        ...aetherCondOrders.map(o => ({
+                          id: o.id,
+                          source: 'Aether',
+                          action: o.action.toUpperCase(),
+                          price: o.triggerValue,
+                          amount: o.amountTokens,
+                          symbol: o.symbol,
+                          type: o.executionType,
+                          details: `Virtual: ${o.triggerType === 'price_below' ? 'Price <' : o.triggerType === 'price_above' ? 'Price >' : 'Time >'} $${o.triggerValue.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+                        }))
+                      ];
+
+                      if (allOrders.length === 0) {
+                        return (
+                          <div style={{ fontSize: '0.62rem', color: 'var(--term-text-secondary)', fontStyle: 'italic', padding: '2px 0' }}>
+                            No active open orders.
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '160px', overflowY: 'auto' }}>
+                          {allOrders.map(order => {
+                            const isBuy = order.action === 'BUY';
+                            return (
+                              <div key={order.id} style={{ 
+                                display: 'flex', 
+                                justifyContent: 'space-between', 
+                                alignItems: 'center', 
+                                padding: '4px 6px', 
+                                background: 'rgba(255, 255, 255, 0.01)', 
+                                border: '1px solid rgba(255, 255, 255, 0.03)', 
+                                borderRadius: '4px',
+                                fontSize: '0.64rem'
+                              }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                  <span style={{ 
+                                    fontSize: '0.52rem', 
+                                    padding: '1px 3px', 
+                                    borderRadius: '3px',
+                                    fontWeight: 'bold',
+                                    color: isBuy ? 'var(--term-green)' : 'var(--term-accent-coral)',
+                                    background: isBuy ? 'rgba(74, 222, 128, 0.08)' : 'rgba(248, 113, 113, 0.08)'
+                                  }}>
+                                    {order.action}
+                                  </span>
+                                  <span style={{ 
+                                    fontSize: '0.52rem', 
+                                    padding: '1px 3px', 
+                                    borderRadius: '3px',
+                                    fontWeight: 'bold',
+                                    color: order.source === 'Coinbase' ? '#55c2ff' : '#d280ff',
+                                    background: order.source === 'Coinbase' ? 'rgba(85, 194, 255, 0.08)' : 'rgba(210, 128, 255, 0.08)',
+                                    border: `1px solid ${order.source === 'Coinbase' ? 'rgba(85, 194, 255, 0.15)' : 'rgba(210, 128, 255, 0.15)'}`
+                                  }}>
+                                    {order.source}
+                                  </span>
+                                  <span style={{ color: 'var(--term-text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                    {order.amount ? `${order.amount.toFixed(2)} ${order.symbol.split('/')[0]}` : `${order.symbol.split('/')[0]}`}
+                                  </span>
+                                </div>
+                                <span style={{ color: '#fff', fontWeight: 'bold', fontFamily: 'var(--font-mono)' }}>
+                                  {order.details}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+                  </div>
                 </div>
               </div>
 
@@ -2165,7 +2445,14 @@ export default function App() {
                   <span>{status?.settings?.selectedAsset || 'BTC/USD'} Chart Terminal</span>
                 </div>
                 <div className="term-chart-frame">
-                  <CustomTradingChart candleData={candleData} symbol={status?.settings?.selectedAsset || 'BTC/USD'} />
+                  <CustomTradingChart
+                    candleData={candleData}
+                    setCandleData={setCandleData}
+                    symbol={status?.settings?.selectedAsset || 'BTC/USD'}
+                    selectedAsset={status?.settings?.selectedAsset || 'BTC/USD'}
+                    selectedTimeframe={status?.settings?.selectedTimeframe || '1h'}
+                    backendUrl={BACKEND_URL}
+                  />
                 </div>
               </div>
             </div>
