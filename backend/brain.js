@@ -342,6 +342,8 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
                   text: promptText
                 }]
               }],
+              generationConfig: {
+                responseMimeType: "application/json",
                 responseSchema: {
                   type: "OBJECT",
                   properties: {
@@ -398,6 +400,7 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
                     "proposed_conditional_orders"
                   ]
                 }
+              }
             }),
             signal: controller.signal
           });
