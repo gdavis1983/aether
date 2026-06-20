@@ -1065,6 +1065,43 @@ export default function App() {
     symbol: 'BTC/USD'
   });
 
+  const [activeDesk, setActiveDesk] = useState('spot');
+  const [manualLeverage, setManualLeverage] = useState(5);
+
+  const handleToggleDesk = async (desk) => {
+    setActiveDesk(desk);
+    try {
+      const baseSettings = status?.settings || settingsForm;
+      const updatedSettings = { ...baseSettings, activeDesk: desk };
+      setSettingsForm(updatedSettings);
+      await fetch(`${BACKEND_URL}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedSettings)
+      });
+      fetchData();
+    } catch (err) {
+      console.error("Error updating desk mode on backend:", err);
+    }
+  };
+
+  const handleUpdateLeverage = async (lev) => {
+    setManualLeverage(lev);
+    try {
+      const baseSettings = status?.settings || settingsForm;
+      const updatedSettings = { ...baseSettings, defaultLeverage: lev };
+      setSettingsForm(updatedSettings);
+      await fetch(`${BACKEND_URL}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedSettings)
+      });
+      fetchData();
+    } catch (err) {
+      console.error("Error updating leverage on backend:", err);
+    }
+  };
+
   // Backtester state
   const [backtestConfig, setBacktestConfig] = useState({
     symbol: 'BTC/USD',
@@ -1131,6 +1168,12 @@ export default function App() {
         setSettingsForm(statusData.settings);
         setManualTrade(prev => ({ ...prev, symbol: statusData.settings.selectedAsset }));
         setBacktestConfig(prev => ({ ...prev, symbol: statusData.settings.selectedAsset, timeframe: statusData.settings.selectedTimeframe }));
+        if (statusData.settings.activeDesk) {
+          setActiveDesk(statusData.settings.activeDesk);
+        }
+        if (statusData.settings.defaultLeverage) {
+          setManualLeverage(statusData.settings.defaultLeverage);
+        }
         
         try {
           const chatRes = await fetch(`${BACKEND_URL}/api/chat/history`);
@@ -1713,7 +1756,9 @@ export default function App() {
         body: JSON.stringify({
           action,
           amountPct: manualTrade.amountPct,
-          symbol: status.settings.selectedAsset
+          symbol: status.settings.selectedAsset,
+          tradeType: activeDesk === 'futures' ? 'futures' : 'spot',
+          leverage: manualLeverage
         })
       });
       const data = await res.json();
@@ -1795,7 +1840,7 @@ export default function App() {
   const peakPrice = status?.highestPriceReached?.[assetName] || holdingsInfo.avgEntryPrice || 0;
 
   return (
-    <div className={`app-container ${isNavExpanded ? 'nav-expanded' : 'nav-collapsed'}`}>
+    <div className={`app-container ${isNavExpanded ? 'nav-expanded' : 'nav-collapsed'}`} data-desk={activeDesk}>
       
       {/* SIDEBAR NAVIGATION */}
       <aside className={`side-nav ${isNavExpanded ? 'expanded' : 'collapsed'}`}>
@@ -1929,6 +1974,90 @@ export default function App() {
       </aside>
 
       <div className="main-viewport" style={{ position: 'relative' }}>
+        {/* Global Desk Toggle HUD */}
+        <header className="glass-panel desk-toggle-hud" style={{
+          height: '52px',
+          minHeight: '52px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '0 16px',
+          marginBottom: '10px',
+          background: 'rgba(21, 21, 21, 0.4)',
+          borderRadius: '12px',
+          border: '1px solid var(--border-color)',
+          flexShrink: 0,
+          boxSizing: 'border-box'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{
+              fontSize: '0.85rem',
+              fontWeight: 'bold',
+              letterSpacing: '0.5px',
+              textTransform: 'uppercase',
+              color: 'var(--color-primary)'
+            }}>
+              Aether {activeDesk === 'futures' ? 'Perpetual Futures' : 'Spot Trading'} Desk
+            </span>
+            <span style={{
+              fontSize: '0.62rem',
+              color: 'var(--color-secondary)',
+              background: 'rgba(255,255,255,0.04)',
+              padding: '2px 6px',
+              borderRadius: '4px',
+              border: '1px solid rgba(255,255,255,0.08)'
+            }}>
+              Phase 1 Engine
+            </span>
+          </div>
+          
+          {/* Sliding Toggle Switch */}
+          <div className="toggle-switch-container" onClick={() => handleToggleDesk(activeDesk === 'spot' ? 'futures' : 'spot')} style={{
+            display: 'flex',
+            background: 'rgba(0,0,0,0.5)',
+            borderRadius: '20px',
+            padding: '3px',
+            border: '1px solid var(--border-color)',
+            position: 'relative',
+            width: '200px',
+            height: '28px',
+            alignItems: 'center',
+            cursor: 'pointer',
+            boxSizing: 'border-box'
+          }}>
+            <div className="toggle-slider" style={{
+              position: 'absolute',
+              width: '94px',
+              height: '20px',
+              background: activeDesk === 'futures' ? 'var(--color-danger)' : 'var(--color-secondary)',
+              boxShadow: activeDesk === 'futures' ? '0 0 8px rgba(236,72,153,0.3)' : 'none',
+              borderRadius: '15px',
+              transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+              left: activeDesk === 'futures' ? '101px' : '3px'
+            }} />
+            <span style={{
+              flex: 1,
+              textAlign: 'center',
+              fontSize: '0.68rem',
+              fontWeight: 'bold',
+              zIndex: 1,
+              color: activeDesk === 'spot' ? '#fff' : 'var(--color-text-dark)',
+              transition: 'color 0.2s',
+              userSelect: 'none'
+            }}>SPOT</span>
+            <span style={{
+              flex: 1,
+              textAlign: 'center',
+              fontSize: '0.68rem',
+              fontWeight: 'bold',
+              zIndex: 1,
+              color: activeDesk === 'futures' ? '#fff' : 'var(--color-text-dark)',
+              transition: 'color 0.2s',
+              userSelect: 'none'
+            }}>FUTURES</span>
+          </div>
+        </header>
+
       {activeTab === 'dashboard' && (
         <div className="aether-dashboard-wrapper fade-in">
           <CognitiveAnalysis status={status} />
@@ -1938,38 +2067,82 @@ export default function App() {
               {/* Valuation Dashboard */}
               <div className="term-panel" style={{ height: '160px', minHeight: '160px', maxHeight: '160px', display: 'flex', flexDirection: 'column' }}>
                 <div className="term-panel-header">
-                  <span>Valuation Dashboard</span>
+                  <span>Valuation Dashboard ({activeDesk === 'futures' ? 'Futures' : 'Spot'})</span>
                 </div>
-                <div className="wallet-box" style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 12px', justifyContent: 'center' }}>
-                  <div style={{ display: 'flex', flexDirection: 'column' }}>
-                    <span className="text-muted" style={{ textTransform: 'uppercase', fontSize: '0.62rem', letterSpacing: '0.5px' }}>Total Net Worth</span>
-                    <span className="wallet-net-worth" style={{ fontSize: '1.25rem', marginTop: '1px' }}>
-                      ${totalPortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </span>
-                  </div>
-                  <div style={{ borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: '5px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
-                      <span className="text-muted">Cash (USD)</span>
-                      <span style={{ fontWeight: '600', color: '#fff' }}>
-                        ${(status?.portfolio?.balanceUSD || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                {activeDesk === 'spot' ? (
+                  <div className="wallet-box" style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 12px', justifyContent: 'center' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                      <span className="text-muted" style={{ textTransform: 'uppercase', fontSize: '0.62rem', letterSpacing: '0.5px' }}>Total Net Worth</span>
+                      <span className="wallet-net-worth" style={{ fontSize: '1.25rem', marginTop: '1px' }}>
+                        ${totalPortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </span>
                     </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
-                      <span className="text-muted">Market Valuation</span>
-                      <span style={{ fontWeight: '600', color: holdingsValuation > 0 ? 'var(--term-accent-cyan)' : '#fff' }}>
-                        ${holdingsValuation.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </span>
-                    </div>
-                    {holdingsInfo.amount > 0 && (
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', borderTop: '1px dashed rgba(255,255,255,0.03)', paddingTop: '3px' }}>
-                        <span className="text-muted">Active Position</span>
-                        <span style={{ color: 'var(--term-green)', fontWeight: 'bold' }}>
-                          {holdingsInfo.amount.toFixed(4)} {assetName}
+                    <div style={{ borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: '5px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                        <span className="text-muted">Cash (USD)</span>
+                        <span style={{ fontWeight: '600', color: '#fff' }}>
+                          ${(status?.portfolio?.balanceUSD || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </span>
                       </div>
-                    )}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                        <span className="text-muted">Market Valuation</span>
+                        <span style={{ fontWeight: '600', color: holdingsValuation > 0 ? 'var(--term-accent-cyan)' : '#fff' }}>
+                          ${holdingsValuation.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                      </div>
+                      {holdingsInfo.amount > 0 && (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', borderTop: '1px dashed rgba(255,255,255,0.03)', paddingTop: '3px' }}>
+                          <span className="text-muted">Active Position</span>
+                          <span style={{ color: 'var(--term-green)', fontWeight: 'bold' }}>
+                            {holdingsInfo.amount.toFixed(4)} {assetName}
+                          </span>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  <div className="wallet-box" style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '5px', padding: '6px 12px', justifyContent: 'center' }}>
+                    {(() => {
+                      const futuresMargin = status?.portfolio?.futures?.marginBalanceUSD || 0;
+                      const futuresPositions = status?.portfolio?.futures?.positions || {};
+                      let lockedMargin = 0;
+                      let futuresUnrealizedPnL = 0;
+                      Object.keys(futuresPositions).forEach(key => {
+                        lockedMargin += futuresPositions[key].margin || 0;
+                        futuresUnrealizedPnL += futuresPositions[key].unrealizedPnL || 0;
+                      });
+                      const totalFuturesEquity = futuresMargin + lockedMargin + futuresUnrealizedPnL;
+
+                      return (
+                        <>
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span className="text-muted" style={{ textTransform: 'uppercase', fontSize: '0.62rem', letterSpacing: '0.5px' }}>Futures Account Equity</span>
+                            <span className="wallet-net-worth" style={{ fontSize: '1.25rem', marginTop: '1px' }}>
+                              ${totalFuturesEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </span>
+                          </div>
+                          <div style={{ borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: '5px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                              <span className="text-muted">Available Margin</span>
+                              <span style={{ fontWeight: '600', color: '#fff' }}>
+                                ${futuresMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                              <span className="text-muted">Unrealized Futures P&L</span>
+                              <span className={futuresUnrealizedPnL !== 0 ? "blink-anim" : ""} style={{ 
+                                fontWeight: '600', 
+                                color: futuresUnrealizedPnL >= 0 ? 'var(--term-green)' : 'var(--color-danger)' 
+                              }}>
+                                {futuresUnrealizedPnL >= 0 ? '+' : ''}${futuresUnrealizedPnL.toFixed(2)}
+                              </span>
+                            </div>
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
               </div>
 
               {/* Active Positions & Trust Integrity Visualizer */}
@@ -1978,165 +2151,317 @@ export default function App() {
                   <span>Active Positions & Trust Indicators</span>
                 </div>
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: '8px 10px' }}>
-                  {holdingsInfo.amount > 0 ? (
-                    <div style={{ 
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '8px',
-                      flex: 1,
-                      minHeight: 0,
-                      overflowY: 'auto',
-                      paddingRight: '4px'
-                    }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ fontWeight: 'bold', fontSize: '0.8rem', color: '#fff' }}>{assetName.split('/')[0]} Long Position</span>
-                        <span className="intel-badge bullish" style={{ fontSize: '0.6rem', padding: '1px 5px', borderRadius: '4px', color: 'var(--term-green)', background: 'rgba(74, 222, 128, 0.08)', border: '1px solid rgba(74, 222, 128, 0.15)' }}>Active</span>
-                      </div>
-                      
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
-                        <div style={{ display: 'flex', flexDirection: 'column' }}>
-                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Position Size</span>
-                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>{holdingsInfo.amount.toFixed(6)} {assetName.split('/')[0]}</span>
+                  {activeDesk === 'spot' ? (
+                    holdingsInfo.amount > 0 ? (
+                      <div style={{ 
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '8px',
+                        flex: 1,
+                        minHeight: 0,
+                        overflowY: 'auto',
+                        paddingRight: '4px'
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ fontWeight: 'bold', fontSize: '0.8rem', color: '#fff' }}>{assetName.split('/')[0]} Long Position</span>
+                          <span className="intel-badge bullish" style={{ fontSize: '0.6rem', padding: '1px 5px', borderRadius: '4px', color: 'var(--term-green)', background: 'rgba(74, 222, 128, 0.08)', border: '1px solid rgba(74, 222, 128, 0.15)' }}>Active</span>
                         </div>
-                        <div style={{ display: 'flex', flexDirection: 'column' }}>
-                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Entry Price</span>
-                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
+                        
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Position Size</span>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>{holdingsInfo.amount.toFixed(6)} {assetName.split('/')[0]}</span>
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Entry Price</span>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
+                          </div>
                         </div>
-                      </div>
 
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
-                        <div style={{ display: 'flex', flexDirection: 'column' }}>
-                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Current Price</span>
-                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>${currentAssetPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
-                        </div>
-                        <div style={{ display: 'flex', flexDirection: 'column' }}>
-                          <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Unrealized P&L</span>
-                          <span style={{ 
-                            fontFamily: 'var(--font-mono)', 
-                            fontSize: '0.74rem', 
-                            fontWeight: 'bold', 
-                            marginTop: '1px',
-                            color: (currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount >= 0 ? 'var(--term-green)' : 'var(--term-red)'
-                          }}>
-                            {((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount) >= 0 ? '+' : ''}
-                            ${((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount).toFixed(2)} 
-                            <span style={{ fontSize: '0.62rem', marginLeft: '4px', fontWeight: 'normal' }}>
-                              ({holdingsInfo.avgEntryPrice > 0 ? (((currentAssetPrice - holdingsInfo.avgEntryPrice) / holdingsInfo.avgEntryPrice) * 100).toFixed(2) : '0.00'}%)
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Current Price</span>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>${currentAssetPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Unrealized P&L</span>
+                            <span style={{ 
+                              fontFamily: 'var(--font-mono)', 
+                              fontSize: '0.74rem', 
+                              fontWeight: 'bold', 
+                              marginTop: '1px',
+                              color: (currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount >= 0 ? 'var(--term-green)' : 'var(--term-red)'
+                            }}>
+                              {((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount) >= 0 ? '+' : ''}
+                              ${((currentAssetPrice - holdingsInfo.avgEntryPrice) * holdingsInfo.amount).toFixed(2)} 
+                              <span style={{ fontSize: '0.62rem', marginLeft: '4px', fontWeight: 'normal' }}>
+                                ({holdingsInfo.avgEntryPrice > 0 ? (((currentAssetPrice - holdingsInfo.avgEntryPrice) / holdingsInfo.avgEntryPrice) * 100).toFixed(2) : '0.00'}%)
+                              </span>
                             </span>
-                          </span>
+                          </div>
                         </div>
+
+                        {/* Visual Position progress bar / gauge */}
+                        {(() => {
+                          const stops = status?.activeTradeStops;
+                          if (!stops) return null;
+
+                          const activeStopsList = [];
+                          if (stops.stopLossPrice) activeStopsList.push(stops.stopLossPrice);
+                          if (stops.atrStopPrice) activeStopsList.push(stops.atrStopPrice);
+                          if (stops.trailingStopPrice) activeStopsList.push(stops.trailingStopPrice);
+                          
+                          const activeFloor = activeStopsList.length > 0 ? Math.max(...activeStopsList) : (holdingsInfo.avgEntryPrice * 0.9);
+                          const activeCeiling = stops.takeProfitPrice || (holdingsInfo.avgEntryPrice * 1.1);
+                          
+                          const totalRange = activeCeiling - activeFloor;
+                          const gaugePercent = totalRange > 0 ? Math.max(0, Math.min(100, ((currentAssetPrice - activeFloor) / totalRange) * 100)) : 50;
+                          const entryPercent = totalRange > 0 ? Math.max(0, Math.min(100, ((holdingsInfo.avgEntryPrice - activeFloor) / totalRange) * 100)) : 50;
+                          
+                          return (
+                            <div style={{ marginTop: '2px', borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '6px' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.6rem', fontWeight: 'bold', color: 'var(--term-accent-cyan)', marginBottom: '3px' }}>
+                                <span>TRADE INTEGRITY BOUNDARY</span>
+                                <span style={{ fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontWeight: 'normal' }}>
+                                  Floor: {activeStopsList.length > 0 ? 'Active stops' : 'Estimated Floor'}
+                                </span>
+                              </div>
+                              
+                              <div style={{ position: 'relative', height: '14px', margin: '6px 0', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.05)', overflow: 'hidden' }}>
+                                {/* Drawdown Zone (Red) */}
+                                <div style={{ position: 'absolute', left: '0', width: `${entryPercent}%`, height: '100%', background: 'linear-gradient(90deg, rgba(239, 68, 68, 0.15) 0%, rgba(239, 68, 68, 0.03) 100%)' }} />
+                                {/* Profit Zone (Green) */}
+                                <div style={{ position: 'absolute', left: `${entryPercent}%`, right: '0', height: '100%', background: 'linear-gradient(90deg, rgba(34, 197, 94, 0.03) 0%, rgba(34, 197, 94, 0.15) 100%)' }} />
+                                
+                                {/* Entry Price Line marker */}
+                                <div style={{ position: 'absolute', left: `${entryPercent}%`, top: '0', bottom: '0', width: '2px', backgroundColor: 'rgba(255,255,255,0.35)', zIndex: 2 }} />
+                                
+                                {/* Current Price Marker */}
+                                <div style={{ 
+                                  position: 'absolute', 
+                                  left: `${gaugePercent}%`, 
+                                  top: '50%', 
+                                  transform: 'translate(-50%, -50%)', 
+                                  width: '6px', 
+                                  height: '6px', 
+                                  borderRadius: '50%', 
+                                  backgroundColor: currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--term-green)' : 'var(--term-red)', 
+                                  boxShadow: `0 0 8px ${currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--term-green)' : 'var(--term-red)'}`,
+                                  zIndex: 3
+                                }} />
+                              </div>
+                              
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                <span title="Closest Stop Floor" style={{ color: activeStopsList.length > 0 ? 'var(--term-red)' : 'inherit' }}>
+                                  Floor: ${activeFloor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                </span>
+                                <span title="Entry Price">
+                                  Entry: ${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                </span>
+                                <span title="Take Profit Target" style={{ color: stops.takeProfitPrice ? 'var(--term-green)' : 'inherit' }}>
+                                  Target: ${activeCeiling.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })()}
+
+                        {/* Stop details list */}
+                        {(() => {
+                          const stops = status?.activeTradeStops;
+                          if (!stops) return null;
+
+                          const formatRow = (name, val, isEnabled, isProfit = false) => {
+                            if (!isEnabled || !val) return null;
+                            const pct = (((val - currentAssetPrice) / currentAssetPrice) * 100);
+                            return (
+                              <div key={name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.62rem', padding: '2px 0', borderBottom: '1px dashed rgba(255,255,255,0.015)' }}>
+                                <span className="text-muted" style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                  <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: isProfit ? 'var(--term-green)' : 'var(--term-red)' }}></span>
+                                  {name}
+                                </span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: '#fff' }}>
+                                  ${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                  <span style={{ marginLeft: '4px', fontSize: '0.58rem', color: isProfit ? 'var(--term-green)' : 'var(--term-red)' }}>
+                                    ({pct >= 0 ? '+' : ''}{pct.toFixed(2)}%)
+                                  </span>
+                                </span>
+                              </div>
+                            );
+                          };
+
+                          const hasAnyStop = stops.stopLossPrice || stops.atrStopPrice || stops.trailingStopPrice || stops.takeProfitPrice;
+
+                          return hasAnyStop ? (
+                            <div style={{ borderTop: '1px dashed rgba(255,255,255,0.03)', paddingTop: '6px', marginTop: '2px' }}>
+                              <span style={{ fontSize: '0.58rem', textTransform: 'uppercase', color: 'var(--term-text-secondary)', fontWeight: 'bold', display: 'block', marginBottom: '3px' }}>
+                                ACTIVE SAFETY LIMITS
+                              </span>
+                              {formatRow('Hard Stop Loss', stops.stopLossPrice, !!stops.stopLossPrice)}
+                              {formatRow('ATR Volatility Stop', stops.atrStopPrice, !!stops.atrStopPrice)}
+                              {formatRow('Trailing Stop Loss', stops.trailingStopPrice, !!stops.trailingStopPrice)}
+                              {formatRow('Take Profit Target', stops.takeProfitPrice, !!stops.takeProfitPrice, true)}
+                            </div>
+                          ) : null;
+                        })()}
                       </div>
+                    ) : (
+                      <div style={{ textAlign: 'center', padding: '16px', color: 'var(--term-text-secondary)', fontSize: '0.72rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: '8px' }}>
+                        <div className="radar-pulse" style={{ width: '12px', height: '12px', borderRadius: '50%', background: 'var(--term-accent-cyan)', boxShadow: '0 0 10px var(--term-accent-cyan)', animation: 'pulse-glow 2s infinite ease-in-out' }} />
+                        <span style={{ color: '#fff', fontSize: '0.75rem', fontWeight: 'bold', letterSpacing: '0.5px' }}>BOT IS ONLINE & SCANNING</span>
+                        <span style={{ fontSize: '0.64rem', color: 'var(--term-text-secondary)' }}>Monitoring markets for Elliott Wave patterns and momentum triggers.</span>
+                      </div>
+                    )
+                  ) : (
+                    (() => {
+                      const pos = status?.portfolio?.futures?.positions?.[assetName];
+                      if (pos && pos.amount > 0.0001) {
+                        const isLong = pos.side === 'LONG';
+                        const pnl = pos.unrealizedPnL || 0;
+                        const returnPct = pos.margin > 0 ? (pnl / pos.margin) * 100 : 0;
+                        
+                        const entryPrice = pos.entryPrice;
+                        const liqPrice = pos.liquidationPrice;
+                        let safetyPercent = 50;
+                        if (isLong) {
+                          safetyPercent = entryPrice > liqPrice ? Math.max(0, Math.min(100, ((currentAssetPrice - liqPrice) / (entryPrice - liqPrice)) * 100)) : 50;
+                        } else {
+                          safetyPercent = liqPrice > entryPrice ? Math.max(0, Math.min(100, ((liqPrice - currentAssetPrice) / (liqPrice - entryPrice)) * 100)) : 50;
+                        }
 
-                      {/* Visual Position progress bar / gauge */}
-                      {(() => {
-                        const stops = status?.activeTradeStops;
-                        if (!stops) return null;
-
-                        const activeStopsList = [];
-                        if (stops.stopLossPrice) activeStopsList.push(stops.stopLossPrice);
-                        if (stops.atrStopPrice) activeStopsList.push(stops.atrStopPrice);
-                        if (stops.trailingStopPrice) activeStopsList.push(stops.trailingStopPrice);
-                        
-                        const activeFloor = activeStopsList.length > 0 ? Math.max(...activeStopsList) : (holdingsInfo.avgEntryPrice * 0.9);
-                        const activeCeiling = stops.takeProfitPrice || (holdingsInfo.avgEntryPrice * 1.1);
-                        
-                        const totalRange = activeCeiling - activeFloor;
-                        const gaugePercent = totalRange > 0 ? Math.max(0, Math.min(100, ((currentAssetPrice - activeFloor) / totalRange) * 100)) : 50;
-                        const entryPercent = totalRange > 0 ? Math.max(0, Math.min(100, ((holdingsInfo.avgEntryPrice - activeFloor) / totalRange) * 100)) : 50;
-                        
                         return (
-                          <div style={{ marginTop: '2px', borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '6px' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.6rem', fontWeight: 'bold', color: 'var(--term-accent-cyan)', marginBottom: '3px' }}>
-                              <span>TRADE INTEGRITY BOUNDARY</span>
-                              <span style={{ fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontWeight: 'normal' }}>
-                                Floor: {activeStopsList.length > 0 ? 'Active stops' : 'Estimated Floor'}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', flex: 1, minHeight: 0, overflowY: 'auto' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontWeight: 'bold', fontSize: '0.8rem', color: '#fff' }}>
+                                {assetName} {pos.side} ({pos.leverage}x)
+                              </span>
+                              <span className={`intel-badge ${isLong ? 'bullish' : 'bearish'}`} style={{
+                                fontSize: '0.6rem',
+                                padding: '1px 5px',
+                                borderRadius: '4px',
+                                color: isLong ? 'var(--term-green)' : 'var(--color-danger)',
+                                background: isLong ? 'rgba(74, 222, 128, 0.08)' : 'rgba(236, 72, 153, 0.08)',
+                                border: `1px solid ${isLong ? 'rgba(74, 222, 128, 0.15)' : 'rgba(236, 72, 153, 0.15)'}`
+                              }}>
+                                Active Perp
                               </span>
                             </div>
-                            
-                            <div style={{ position: 'relative', height: '14px', margin: '6px 0', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.05)', overflow: 'hidden' }}>
-                              {/* Drawdown Zone (Red) */}
-                              <div style={{ position: 'absolute', left: '0', width: `${entryPercent}%`, height: '100%', background: 'linear-gradient(90deg, rgba(239, 68, 68, 0.15) 0%, rgba(239, 68, 68, 0.03) 100%)' }} />
-                              {/* Profit Zone (Green) */}
-                              <div style={{ position: 'absolute', left: `${entryPercent}%`, right: '0', height: '100%', background: 'linear-gradient(90deg, rgba(34, 197, 94, 0.03) 0%, rgba(34, 197, 94, 0.15) 100%)' }} />
-                              
-                              {/* Entry Price Line marker */}
-                              <div style={{ position: 'absolute', left: `${entryPercent}%`, top: '0', bottom: '0', width: '2px', backgroundColor: 'rgba(255,255,255,0.35)', zIndex: 2 }} />
-                              
-                              {/* Current Price Marker */}
-                              <div style={{ 
-                                position: 'absolute', 
-                                left: `${gaugePercent}%`, 
-                                top: '50%', 
-                                transform: 'translate(-50%, -50%)', 
-                                width: '6px', 
-                                height: '6px', 
-                                borderRadius: '50%', 
-                                backgroundColor: currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--term-green)' : 'var(--term-red)', 
-                                boxShadow: `0 0 8px ${currentAssetPrice >= holdingsInfo.avgEntryPrice ? 'var(--term-green)' : 'var(--term-red)'}`,
-                                zIndex: 3
-                              }} />
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Contracts Size</span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>
+                                  {pos.amount.toFixed(4)} contracts
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Position Margin</span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>
+                                  ${pos.margin.toFixed(2)} USD
+                                </span>
+                              </div>
                             </div>
-                            
-                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontFamily: 'var(--font-mono)' }}>
-                              <span title="Closest Stop Floor" style={{ color: activeStopsList.length > 0 ? 'var(--term-red)' : 'inherit' }}>
-                                Floor: ${activeFloor.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                              </span>
-                              <span title="Entry Price">
-                                Entry: ${holdingsInfo.avgEntryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                              </span>
-                              <span title="Take Profit Target" style={{ color: stops.takeProfitPrice ? 'var(--term-green)' : 'inherit' }}>
-                                Target: ${activeCeiling.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                              </span>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Entry Price</span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>
+                                  ${pos.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Liquidation Price</span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: 'var(--color-danger)', marginTop: '1px' }}>
+                                  ${pos.liquidationPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                </span>
+                              </div>
+                            </div>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', background: 'rgba(255, 255, 255, 0.015)', border: '1px solid rgba(255, 255, 255, 0.03)', padding: '6px 8px', borderRadius: '6px' }}>
+                              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Current Price</span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', fontWeight: 'bold', color: '#fff', marginTop: '1px' }}>
+                                  ${currentAssetPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <span className="text-muted" style={{ fontSize: '0.58rem', textTransform: 'uppercase' }}>Unrealized P&L</span>
+                                <span className={pnl !== 0 ? "blink-anim" : ""} style={{ 
+                                  fontFamily: 'var(--font-mono)', 
+                                  fontSize: '0.74rem', 
+                                  fontWeight: 'bold', 
+                                  marginTop: '1px',
+                                  color: pnl >= 0 ? 'var(--term-green)' : 'var(--color-danger)'
+                                }}>
+                                  {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} 
+                                  <span style={{ fontSize: '0.62rem', marginLeft: '4px', fontWeight: 'normal' }}>
+                                    ({returnPct >= 0 ? '+' : ''}{returnPct.toFixed(2)}%)
+                                  </span>
+                                </span>
+                              </div>
+                            </div>
+
+                            <div style={{ marginTop: '2px', borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '6px' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.6rem', fontWeight: 'bold', color: 'var(--color-danger)', marginBottom: '3px' }}>
+                                <span>LIQUIDATION SAFETY BOUNDARY</span>
+                                <span style={{ fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontWeight: 'normal' }}>
+                                  Safety Margin: {safetyPercent.toFixed(1)}%
+                                </span>
+                              </div>
+                              
+                              <div style={{ position: 'relative', height: '14px', margin: '6px 0', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.05)', overflow: 'hidden' }}>
+                                <div style={{
+                                  position: 'absolute',
+                                  left: isLong ? '0' : `${100 - safetyPercent}%`,
+                                  width: `${safetyPercent}%`,
+                                  height: '100%',
+                                  background: safetyPercent > 50 
+                                    ? 'linear-gradient(90deg, rgba(34, 197, 94, 0.03) 0%, rgba(34, 197, 94, 0.15) 100%)'
+                                    : safetyPercent > 20
+                                    ? 'linear-gradient(90deg, rgba(245, 158, 11, 0.03) 0%, rgba(245, 158, 11, 0.15) 100%)'
+                                    : 'linear-gradient(90deg, rgba(239, 68, 68, 0.05) 0%, rgba(239, 68, 68, 0.25) 100%)',
+                                  animation: safetyPercent <= 20 ? 'pulse-danger 1s infinite' : 'none'
+                                }} />
+                                
+                                {/* Entry marker */}
+                                <div style={{ position: 'absolute', left: isLong ? '100%' : '0%', transform: 'translateX(-50%)', top: '0', bottom: '0', width: '2px', backgroundColor: 'rgba(255,255,255,0.35)', zIndex: 2 }} />
+                                
+                                {/* Current marker */}
+                                <div style={{ 
+                                  position: 'absolute', 
+                                  left: `${isLong ? safetyPercent : 100 - safetyPercent}%`, 
+                                  top: '50%', 
+                                  transform: 'translate(-50%, -50%)', 
+                                  width: '6px', 
+                                  height: '6px', 
+                                  borderRadius: '50%', 
+                                  backgroundColor: safetyPercent > 50 ? 'var(--term-green)' : safetyPercent > 20 ? 'orange' : 'var(--color-danger)', 
+                                  boxShadow: `0 0 8px ${safetyPercent > 50 ? 'var(--term-green)' : safetyPercent > 20 ? 'orange' : 'var(--color-danger)'}`,
+                                  zIndex: 3
+                                }} />
+                              </div>
+                              
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.55rem', color: 'var(--term-text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                <span title="Liquidation price" style={{ color: 'var(--color-danger)' }}>
+                                  Liq Price: ${pos.liquidationPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                </span>
+                                <span title="Entry price">
+                                  Entry: ${pos.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                </span>
+                              </div>
                             </div>
                           </div>
                         );
-                      })()}
-
-                      {/* Stop details list */}
-                      {(() => {
-                        const stops = status?.activeTradeStops;
-                        if (!stops) return null;
-
-                        const formatRow = (name, val, isEnabled, isProfit = false) => {
-                          if (!isEnabled || !val) return null;
-                          const pct = (((val - currentAssetPrice) / currentAssetPrice) * 100);
-                          return (
-                            <div key={name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.62rem', padding: '2px 0', borderBottom: '1px dashed rgba(255,255,255,0.015)' }}>
-                              <span className="text-muted" style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: isProfit ? 'var(--term-green)' : 'var(--term-red)' }}></span>
-                                {name}
-                              </span>
-                              <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: '#fff' }}>
-                                ${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                                <span style={{ marginLeft: '4px', fontSize: '0.58rem', color: isProfit ? 'var(--term-green)' : 'var(--term-red)' }}>
-                                  ({pct >= 0 ? '+' : ''}{pct.toFixed(2)}%)
-                                </span>
-                              </span>
-                            </div>
-                          );
-                        };
-
-                        const hasAnyStop = stops.stopLossPrice || stops.atrStopPrice || stops.trailingStopPrice || stops.takeProfitPrice;
-
-                        return hasAnyStop ? (
-                          <div style={{ borderTop: '1px dashed rgba(255,255,255,0.03)', paddingTop: '6px', marginTop: '2px' }}>
-                            <span style={{ fontSize: '0.58rem', textTransform: 'uppercase', color: 'var(--term-text-secondary)', fontWeight: 'bold', display: 'block', marginBottom: '3px' }}>
-                              ACTIVE SAFETY LIMITS
-                            </span>
-                            {formatRow('Hard Stop Loss', stops.stopLossPrice, !!stops.stopLossPrice)}
-                            {formatRow('ATR Volatility Stop', stops.atrStopPrice, !!stops.atrStopPrice)}
-                            {formatRow('Trailing Stop Loss', stops.trailingStopPrice, !!stops.trailingStopPrice)}
-                            {formatRow('Take Profit Target', stops.takeProfitPrice, !!stops.takeProfitPrice, true)}
+                      } else {
+                        return (
+                          <div style={{ textAlign: 'center', padding: '16px', color: 'var(--term-text-secondary)', fontSize: '0.72rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: '8px' }}>
+                            <div className="radar-pulse" style={{ width: '12px', height: '12px', borderRadius: '50%', background: 'var(--color-danger)', boxShadow: '0 0 10px var(--color-danger)', animation: 'pulse-glow 2s infinite ease-in-out' }} />
+                            <span style={{ color: '#fff', fontSize: '0.75rem', fontWeight: 'bold', letterSpacing: '0.5px' }}>FUTURES DESK ACTIVE</span>
+                            <span style={{ fontSize: '0.64rem', color: 'var(--term-text-secondary)' }}>No active virtual perpetual swap positions. Leverage slider and manual order triggers available in sidebar.</span>
                           </div>
-                        ) : null;
-                      })()}
-                    </div>
-                  ) : (
-                    <div style={{ textAlign: 'center', padding: '16px', color: 'var(--term-text-secondary)', fontSize: '0.72rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: '8px' }}>
-                      <div className="radar-pulse" style={{ width: '12px', height: '12px', borderRadius: '50%', background: 'var(--term-accent-cyan)', boxShadow: '0 0 10px var(--term-accent-cyan)', animation: 'pulse-glow 2s infinite ease-in-out' }} />
-                      <span style={{ color: '#fff', fontSize: '0.75rem', fontWeight: 'bold', letterSpacing: '0.5px' }}>BOT IS ONLINE & SCANNING</span>
-                      <span style={{ fontSize: '0.64rem', color: 'var(--term-text-secondary)' }}>Monitoring markets for Elliott Wave patterns and momentum triggers.</span>
-                    </div>
+                        );
+                      }
+                    })()
                   )}
 
                   {/* Open Orders Section (Both Coinbase and Aether) */}
@@ -2742,7 +3067,7 @@ export default function App() {
           {/* Quick Manual Trade Pad (Left Column - 350px Sidebar) */}
           <aside className="glass-panel dashboard-sidebar">
             <div className="panel-header">
-              <span className="panel-title"><Sliders size={16} /> Manual Execution</span>
+              <span className="panel-title"><Sliders size={16} /> Manual Execution ({activeDesk === 'futures' ? 'Perp Futures' : 'Spot'})</span>
             </div>
             
             <div className="form-group" style={{ marginTop: '8px' }}>
@@ -2754,21 +3079,99 @@ export default function App() {
                 step="10" 
                 value={manualTrade.amountPct} 
                 onChange={(e) => setManualTrade({ ...manualTrade, amountPct: Number(e.target.value) })}
-                style={{ width: '100%', accentColor: 'var(--color-primary)' }}
+                style={{ width: '100%', accentColor: activeDesk === 'futures' ? 'var(--color-primary)' : 'var(--term-accent-cyan)' }}
               />
-              <div style={{ display: 'flex', justifyContent: 'between', fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>
                 <span>10%</span>
                 <span style={{ marginLeft: 'auto' }}>100%</span>
               </div>
             </div>
 
+            {activeDesk === 'futures' && (
+              <div className="form-group" style={{ marginTop: '10px' }}>
+                <label className="form-label">Leverage Multiplier ({manualLeverage}x)</label>
+                <input 
+                  type="range" 
+                  min="1" 
+                  max="10" 
+                  step="1" 
+                  value={manualLeverage} 
+                  onChange={(e) => handleUpdateLeverage(Number(e.target.value))}
+                  style={{ width: '100%', accentColor: 'var(--color-danger)' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>
+                  <span>1x (No Leverage)</span>
+                  <span style={{ marginLeft: 'auto' }}>10x Max</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '6px', fontSize: '0.68rem', padding: '6px 8px', borderRadius: '4px', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.03)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span className="text-muted">Est. Long Liq Price</span>
+                    <span style={{ color: 'var(--color-danger)', fontWeight: 'bold' }}>
+                      ${(currentAssetPrice * (1 - 1 / manualLeverage)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span className="text-muted">Est. Short Liq Price</span>
+                    <span style={{ color: 'var(--color-danger)', fontWeight: 'bold' }}>
+                      ${(currentAssetPrice * (1 + 1 / manualLeverage)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '12px' }}>
-              <button className="btn btn-success" onClick={() => handleManualTrade('BUY')}>
-                <ArrowUpRight size={18} /> BUY {assetName}
-              </button>
-              <button className="btn btn-danger" onClick={() => handleManualTrade('SELL')}>
-                <ArrowDownRight size={18} /> SELL {assetName}
-              </button>
+              {activeDesk === 'spot' ? (
+                <>
+                  <button className="btn btn-success" onClick={() => handleManualTrade('BUY')}>
+                    <ArrowUpRight size={18} /> BUY {assetName}
+                  </button>
+                  <button className="btn btn-danger" onClick={() => handleManualTrade('SELL')}>
+                    <ArrowDownRight size={18} /> SELL {assetName}
+                  </button>
+                </>
+              ) : (
+                <>
+                  {/* Futures Desk Buttons */}
+                  {(() => {
+                    const pos = status?.portfolio?.futures?.positions?.[assetName];
+                    if (!pos) {
+                      return (
+                        <>
+                          <button className="btn btn-success" onClick={() => handleManualTrade('BUY')}>
+                            <ArrowUpRight size={18} /> BUY / LONG
+                          </button>
+                          <button className="btn btn-danger" style={{ backgroundColor: 'var(--color-danger)', borderColor: 'var(--color-danger)' }} onClick={() => handleManualTrade('SHORT')}>
+                            <ArrowDownRight size={18} /> SELL / SHORT
+                          </button>
+                        </>
+                      );
+                    } else if (pos.side === 'LONG') {
+                      return (
+                        <>
+                          <button className="btn btn-success" onClick={() => handleManualTrade('BUY')}>
+                            <span>+ </span>ADD TO LONG
+                          </button>
+                          <button className="btn btn-danger" style={{ backgroundColor: 'var(--color-danger)', borderColor: 'var(--color-danger)' }} onClick={() => handleManualTrade('SELL')}>
+                            <ArrowDownRight size={18} /> CLOSE LONG (SELL)
+                          </button>
+                        </>
+                      );
+                    } else {
+                      return (
+                        <>
+                          <button className="btn btn-danger" style={{ backgroundColor: 'var(--color-danger)', borderColor: 'var(--color-danger)' }} onClick={() => handleManualTrade('SHORT')}>
+                            <span>+ </span>ADD TO SHORT
+                          </button>
+                          <button className="btn btn-success" onClick={() => handleManualTrade('COVER')}>
+                            <ArrowUpRight size={18} /> CLOSE SHORT (COVER)
+                          </button>
+                        </>
+                      );
+                    }
+                  })()}
+                </>
+              )}
             </div>
 
             <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', marginTop: '12px' }}>
@@ -2776,11 +3179,19 @@ export default function App() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '0.75rem' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span className="text-muted">Last Price</span>
-                  <span style={{ fontWeight: 'bold' }}>${currentAssetPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                  <span style={{ fontWeight: 'bold' }}>${currentAssetPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span className="text-muted">Simulated Fee (0.1%)</span>
-                  <span>${(currentAssetPrice * (manualTrade.amountPct / 100) * totalPortfolioValue * 0.001 / currentAssetPrice).toFixed(4)} {assetName}</span>
+                  <span className="text-muted">
+                    {activeDesk === 'futures' ? `Notional Size (${manualLeverage}x)` : 'Simulated Fee (0.1%)'}
+                  </span>
+                  <span>
+                    {activeDesk === 'futures' ? (
+                      `$${((manualTrade.amountPct / 100) * (status?.portfolio?.futures?.marginBalanceUSD || 100.00) * manualLeverage).toFixed(2)} USD`
+                    ) : (
+                      `$${((currentAssetPrice * (manualTrade.amountPct / 100) * totalPortfolioValue * 0.001) / currentAssetPrice).toFixed(4)} ${assetName}`
+                    )}
+                  </span>
                 </div>
               </div>
             </div>

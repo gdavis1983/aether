@@ -2061,6 +2061,34 @@ body {
   font-family: 'Century Gothic', 'Apple Gothic', sans-serif !important;
 }
 
+/* Futures Desk Accent Themes */
+[data-desk="futures"] {
+  --color-primary: #10B981 !important; /* Neon green primary */
+  --color-success: #059669 !important; /* Richer green for long */
+  --color-danger: #EC4899 !important; /* Neon pink/magenta for short */
+  --color-secondary: #06B6D4 !important; /* Cyan secondary */
+  --term-accent-cyan: #10B981 !important; /* Override layout accents */
+}
+
+/* Custom blinks and animations for premium futures aesthetics */
+@keyframes blink-pnl {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.75; }
+}
+
+.blink-anim {
+  animation: blink-pnl 1.5s infinite ease-in-out;
+}
+
+@keyframes pulse-danger-border {
+  0%, 100% { box-shadow: 0 0 4px rgba(239, 68, 68, 0.2); }
+  50% { box-shadow: 0 0 12px rgba(239, 68, 68, 0.5); }
+}
+
+.pulse-danger {
+  animation: pulse-danger-border 1s infinite ease-in-out;
+}
+
 .rationale-term-text {
   font-family: 'Century Gothic', 'Apple Gothic', sans-serif !important;
 }

@@ -279,7 +279,7 @@ ${customRulesInstruction}
    You MUST scale your "amount_pct" allocation according to the active Market Regime:
    - If marketRegime is "CHOPPY_RANGE" (ADX < 20), you are prohibited from setting amount_pct > 30%. You must make small, defensive trades.
    - If marketRegime is "TRENDING_BULLISH" and RVol > 1.5 (confirmed Wave 3 breakout), you are encouraged to scale up amount_pct to 75%-100% to maximize compounding.
-   - In "TRENDING_BEARISH" regimes, your default action should be HOLD (remaining in cash) or SELL to liquidate remaining assets. Avoid buying.
+   - In "TRENDING_BEARISH" regimes, your default action should be to HOLD (remaining in cash), SHORT (open a leveraged short position near macro resistance), or COVER (buy-back to close/take profit on a short near macro support). Avoid long buying.
 
 ${mtfInstruction}
 
@@ -292,7 +292,7 @@ INSTRUCTIONS FOR RETURNING EXTRA JSON SCHEMA FIELDS:
 4. "news_sentiment_score": Grade the news headlines you read on a scale from -10 (extremely bearish/panic) to +10 (extremely bullish/optimism). If news sentiment is disabled, return 0.
 5. "risk_reward_ratio": Estimate the risk-to-reward ratio for this asset context (e.g., 2.5).
 6. "forward_plan": Write a conversational, detailed summary of your forward trading strategy and outlook for this asset (e.g., "I'm holding for now, but I see a prime Wave C correction bottom forming around $0.52. I plan to schedule a buy entry there, and set a target exit at $0.65 which is our Wave 3 resistance."). Speak directly as a professional employee/partner explaining the plan to the user.
-7. "proposed_conditional_orders": An optional array of virtual target orders representing your multi-legged trading strategy. Propose entry (BUY), target (SELL), and stop invalidation (SELL) targets simultaneously so the bot can track and execute multiple moves over time. Each object requires "action" ("BUY"/"SELL"), "amount_pct" (1-100), "trigger_type" ("price_below"/"price_above"), "trigger_value" (number price), and "reasoning" (brief sentence explaining this leg of the plan).
+7. "proposed_conditional_orders": An optional array of virtual target orders representing your multi-legged trading strategy. Propose entry (BUY/SHORT), target (SELL/COVER), and stop invalidation (SELL/COVER) targets simultaneously so the bot can track and execute multiple moves over time. Each object requires "action" ("BUY"/"SELL"/"SHORT"/"COVER"), "amount_pct" (1-100), "trigger_type" ("price_below"/"price_above"), "trigger_value" (number price), and "reasoning" (brief sentence explaining this leg of the plan).
 
 Remember: Output ONLY valid raw JSON matching the required schema. Do not include markdown codeblocks or extra text.
 `;
@@ -349,7 +349,7 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
                   properties: {
                     decision: {
                       type: "STRING",
-                      enum: ["BUY", "SELL", "HOLD"]
+                      enum: ["BUY", "SELL", "HOLD", "SHORT", "COVER"]
                     },
                     reasoning: {
                       type: "STRING"
@@ -383,7 +383,7 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
                       items: {
                         type: "OBJECT",
                         properties: {
-                          action: { type: "STRING", enum: ["BUY", "SELL"] },
+                          action: { type: "STRING", enum: ["BUY", "SELL", "SHORT", "COVER"] },
                           amount_pct: { type: "INTEGER" },
                           trigger_type: { type: "STRING", enum: ["price_below", "price_above"] },
                           trigger_value: { type: "NUMBER" },
@@ -447,7 +447,7 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
   const decisionObj = JSON.parse(resultText);
   
   // Normalize and validate
-  if (!["BUY", "SELL", "HOLD"].includes(decisionObj.decision)) {
+  if (!["BUY", "SELL", "HOLD", "SHORT", "COVER"].includes(decisionObj.decision)) {
     decisionObj.decision = "HOLD";
   }
   decisionObj.confidence = Math.max(0, Math.min(1, Number(decisionObj.confidence) || 0));

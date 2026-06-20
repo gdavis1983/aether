@@ -126,7 +126,9 @@ const defaultSettings = {
   atrStopEnabled: true,
   atrStopMultiplier: 2.0,
   newsSentimentEnabled: false,
-  maxPositionAllocationPct: 75
+  maxPositionAllocationPct: 75,
+  activeDesk: "spot",
+  defaultLeverage: 5
 };
 
 // Bot interval runtime state
@@ -151,6 +153,16 @@ function readDB() {
       if (parsed.settings) {
         parsed.settings = { ...defaultSettings, ...parsed.settings };
       }
+      if (!parsed.portfolio) {
+        parsed.portfolio = { balanceUSD: 10000, positions: {} };
+      }
+      if (!parsed.portfolio.futures) {
+        parsed.portfolio.futures = {
+          marginBalanceUSD: 100.00,
+          unrealizedPnL: 0.00,
+          positions: {}
+        };
+      }
       if (!parsed.chatMessages) {
         parsed.chatMessages = [];
       }
@@ -165,7 +177,15 @@ function readDB() {
   } catch (err) {
     console.error("Error reading database:", err);
     return { 
-      portfolio: { balanceUSD: 10000, positions: {} }, 
+      portfolio: { 
+        balanceUSD: 10000, 
+        positions: {},
+        futures: {
+          marginBalanceUSD: 100.00,
+          unrealizedPnL: 0.00,
+          positions: {}
+        }
+      }, 
       trades: [], 
       logs: [], 
       settings: { ...defaultSettings }, 
@@ -833,6 +853,480 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
 }
 
 /**
+ * Execute a simulated perpetual paper trade (Phase 1)
+ */
+function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetName, db, reasoning = '') {
+  const feePct = 0.0006; // Typical swap trading fee (0.06%)
+  let tradeDetails = null;
+
+  // Initialize futures database structure if missing
+  if (!db.portfolio.futures) {
+    db.portfolio.futures = {
+      marginBalanceUSD: 100.00,
+      unrealizedPnL: 0.00,
+      positions: {}
+    };
+  }
+  
+  const futures = db.portfolio.futures;
+  if (!futures.positions) {
+    futures.positions = {};
+  }
+
+  // Handle open actions: BUY (Long) and SHORT (Short)
+  if (action === 'BUY' || action === 'SHORT') {
+    const availableMargin = futures.marginBalanceUSD;
+    if (availableMargin <= 5) {
+      return { success: false, message: `Insufficient isolated margin balance ($${availableMargin.toFixed(2)}) to open a trade (must be > $5).` };
+    }
+
+    // Amount to allocate as margin
+    let allocatedMargin = availableMargin * (amountPct / 100);
+    if (allocatedMargin < 5.0 && availableMargin >= 5.0) {
+      allocatedMargin = 5.0; // minimum margin requirement
+    }
+    if (allocatedMargin > availableMargin) {
+      allocatedMargin = availableMargin;
+    }
+
+    // Notional position value controlled
+    const notionalValue = allocatedMargin * leverage;
+    
+    // Fee is calculated on notional size
+    const fee = notionalValue * feePct;
+
+    // Check if we can afford the margin + fee
+    if (allocatedMargin + fee > availableMargin) {
+      // Reduce allocated margin to fit within available margin including fee
+      allocatedMargin = availableMargin / (1 + leverage * feePct);
+      if (allocatedMargin < 1.0) {
+        return { success: false, message: `Cannot afford position margin and trade fees with current balance.` };
+      }
+    }
+
+    const finalNotional = allocatedMargin * leverage;
+    const finalSize = finalNotional / currentPrice;
+    const finalFee = finalNotional * feePct;
+
+    // Deduct fee and subtract allocated margin from available balance
+    futures.marginBalanceUSD -= (allocatedMargin + finalFee);
+
+    const side = action === 'BUY' ? 'LONG' : 'SHORT';
+    
+    // Check if we already have an active opposite position
+    const existingPos = futures.positions[assetName];
+    if (existingPos && existingPos.side !== side) {
+      return { success: false, message: `Cannot open ${side} while holding opposite ${existingPos.side} position. Please close/cover first.` };
+    }
+
+    if (!existingPos) {
+      // Create new position
+      const liquidationPrice = side === 'LONG' 
+        ? currentPrice * (1 - 1 / leverage) 
+        : currentPrice * (1 + 1 / leverage);
+
+      futures.positions[assetName] = {
+        side,
+        amount: finalSize,
+        entryPrice: currentPrice,
+        leverage,
+        margin: allocatedMargin,
+        liquidationPrice: Number(liquidationPrice.toFixed(6)),
+        unrealizedPnL: 0.00
+      };
+    } else {
+      // Scale-in existing position
+      const pos = futures.positions[assetName];
+      const totalNotional = (pos.amount * pos.entryPrice) + finalNotional;
+      pos.amount += finalSize;
+      pos.margin += allocatedMargin;
+      pos.entryPrice = totalNotional / pos.amount;
+      pos.leverage = leverage; // update leverage to current action's leverage
+      
+      // Re-calculate liquidation price
+      const liquidationPrice = pos.side === 'LONG'
+        ? pos.entryPrice * (1 - 1 / pos.leverage)
+        : pos.entryPrice * (1 + 1 / pos.leverage);
+      pos.liquidationPrice = Number(liquidationPrice.toFixed(6));
+    }
+
+    tradeDetails = {
+      timestamp: new Date().toISOString(),
+      symbol: db.settings?.selectedAsset || `${assetName}/USD`,
+      action: action, // BUY or SHORT
+      price: currentPrice,
+      amount: finalSize,
+      total: finalNotional, // notional total
+      fee: finalFee,
+      balanceAfter: futures.marginBalanceUSD,
+      reasoning: reasoning,
+      mode: db.settings?.tradingMode || 'paper',
+      tradeType: 'futures',
+      leverage: leverage
+    };
+
+  } else if (action === 'SELL' || action === 'COVER') {
+    // Handle close actions: SELL (Close Long) and COVER (Close Short)
+    const pos = futures.positions[assetName];
+    if (!pos) {
+      return { success: false, message: `No active perpetual position in ${assetName} to close.` };
+    }
+
+    // Verify correct direction closing
+    if (action === 'SELL' && pos.side !== 'LONG') {
+      return { success: false, message: `Cannot SELL (Close Long) because active XRP position is SHORT. Use COVER to close/reduce short.` };
+    }
+    if (action === 'COVER' && pos.side !== 'SHORT') {
+      return { success: false, message: `Cannot COVER (Close Short) because active XRP position is LONG. Use SELL to close/reduce long.` };
+    }
+
+    const closeAmount = pos.amount * (amountPct / 100);
+    const releasedMargin = pos.margin * (amountPct / 100);
+    const closeNotional = closeAmount * currentPrice;
+    
+    // Calculate PnL
+    let pnl = 0;
+    if (pos.side === 'LONG') {
+      pnl = (currentPrice - pos.entryPrice) * closeAmount;
+    } else {
+      pnl = (pos.entryPrice - currentPrice) * closeAmount;
+    }
+
+    // Fee calculated on closed notional value
+    const fee = closeNotional * feePct;
+    
+    // Return margin + PnL - fee to available balance
+    futures.marginBalanceUSD += (releasedMargin + pnl - fee);
+
+    // Record trade details
+    const netReturnVal = pnl - fee;
+    const netReturnPct = (pnl / (releasedMargin || 1)) * 100;
+
+    tradeDetails = {
+      timestamp: new Date().toISOString(),
+      symbol: db.settings?.selectedAsset || `${assetName}/USD`,
+      action: action, // SELL or COVER
+      price: currentPrice,
+      amount: closeAmount,
+      total: closeNotional,
+      fee: fee,
+      balanceAfter: futures.marginBalanceUSD,
+      reasoning: reasoning,
+      mode: db.settings?.tradingMode || 'paper',
+      tradeType: 'futures',
+      leverage: pos.leverage,
+      netReturnVal: Number(netReturnVal.toFixed(4)),
+      netReturnPct: Number(netReturnPct.toFixed(2)),
+      netReturn: `${netReturnVal >= 0 ? '+' : ''}${netReturnVal.toFixed(2)} USD (${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}%)`
+    };
+
+    // Update or remove position
+    pos.amount -= closeAmount;
+    pos.margin -= releasedMargin;
+
+    if (pos.amount <= 0.0001 || amountPct >= 99.9) {
+      delete futures.positions[assetName];
+    }
+  }
+
+  if (tradeDetails) {
+    if (!db.trades) db.trades = [];
+    db.trades.unshift(tradeDetails);
+    
+    // Recompute unrealized PnL and total portfolio values
+    recalculatePaperFuturesPnL(db, currentPrice, assetName);
+    writeDB(db);
+    return { success: true, trade: tradeDetails };
+  }
+
+  return { success: false, message: `Invalid action specified: ${action}` };
+}
+
+/**
+ * Recomputes paper futures unrealized PnL
+ */
+function recalculatePaperFuturesPnL(db, currentPrice, assetName) {
+  if (!db.portfolio.futures || !db.portfolio.futures.positions) return;
+  const pos = db.portfolio.futures.positions[assetName];
+  if (!pos) return;
+  
+  let pnl = 0;
+  if (pos.side === 'LONG') {
+    pnl = (currentPrice - pos.entryPrice) * pos.amount;
+  } else {
+    pnl = (pos.entryPrice - currentPrice) * pos.amount;
+  }
+  pos.unrealizedPnL = Number(pnl.toFixed(4));
+  
+  // Update global futures unrealized PnL
+  let totalPnL = 0;
+  for (const k of Object.keys(db.portfolio.futures.positions)) {
+    totalPnL += db.portfolio.futures.positions[k].unrealizedPnL || 0;
+  }
+  db.portfolio.futures.unrealizedPnL = Number(totalPnL.toFixed(4));
+}
+
+/**
+ * Helper to resolve the correct CCXT swap/futures symbol
+ */
+function getFuturesSymbol(exchange, symbol) {
+  if (symbol.includes(':')) return symbol;
+  if (exchange.markets) {
+    const parts = symbol.split('/');
+    const base = parts[0];
+    const quote = parts[1] || 'USDC';
+    const candidate1 = `${base}/${quote}:${quote}`;
+    if (exchange.markets[candidate1]) return candidate1;
+    const candidate2 = `${base}/${quote}`;
+    if (exchange.markets[candidate2] && exchange.markets[candidate2].swap) return candidate2;
+    const candidate3 = `${base}-${quote}-PERP`;
+    if (exchange.markets[candidate3]) return candidate3;
+    for (const key of Object.keys(exchange.markets)) {
+      const market = exchange.markets[key];
+      if (market.base === base && market.quote === quote && (market.swap || market.future || key.includes('PERP'))) {
+        return key;
+      }
+    }
+  }
+  return symbol;
+}
+
+/**
+ * Helper to dynamically set Coinbase Advanced Futures portfolio configuration
+ */
+async function ensureCoinbasePortfolio(exchange) {
+  if (exchange.id === 'coinbase' && !exchange.options['portfolio']) {
+    try {
+      const portfolios = await exchange.fetchPortfolios();
+      if (Array.isArray(portfolios) && portfolios.length > 0) {
+        const activePort = portfolios.find(p => p.type === 'futures' || p.name?.toLowerCase().includes('futures') || p.status === 'active') || portfolios[0];
+        if (activePort && activePort.id) {
+          exchange.options['portfolio'] = activePort.id;
+          console.log(`[INFO] Auto-configured Coinbase Futures portfolio option: ${activePort.id} (${activePort.name || 'Default'})`);
+        }
+      }
+    } catch (e) {
+      console.warn("[WARNING] Failed to fetch Coinbase portfolios:", e.message);
+    }
+  }
+}
+
+/**
+ * Syncs the live futures portfolio state and active position for a symbol from CCXT
+ */
+async function syncLiveFuturesState(db, exchange, symbol, assetName, marginCurrency) {
+  try {
+    await ensureCoinbasePortfolio(exchange);
+    if (!db.portfolio.futures) {
+      db.portfolio.futures = {
+        marginBalanceUSD: 100.0,
+        unrealizedPnL: 0.0,
+        positions: {}
+      };
+    }
+    
+    // Resolve futures symbol
+    const futSymbol = getFuturesSymbol(exchange, symbol);
+
+    // Fetch balance
+    const balance = await exchange.fetchBalance({ type: 'future' });
+    db.portfolio.futures.marginBalanceUSD = balance.free[marginCurrency] || balance.total[marginCurrency] || 0;
+
+    // Fetch positions
+    if (typeof exchange.fetchPositions === 'function') {
+      const positions = await exchange.fetchPositions([futSymbol]);
+      const activePos = positions.find(p => p.symbol === futSymbol);
+      
+      if (activePos && parseFloat(activePos.contracts || activePos.amount || 0) !== 0) {
+        const side = activePos.side?.toUpperCase() || (parseFloat(activePos.contracts || activePos.amount || 0) > 0 ? 'LONG' : 'SHORT');
+        const size = Math.abs(parseFloat(activePos.contracts || activePos.amount || 0));
+        const entryPrice = parseFloat(activePos.entryPrice || activePos.avgEntryPrice || 0);
+        const leverage = parseFloat(activePos.leverage || 1);
+        const margin = parseFloat(activePos.initialMargin || activePos.margin || (size * entryPrice / leverage));
+        const liquidationPrice = parseFloat(activePos.liquidationPrice || (side === 'LONG' ? entryPrice * (1 - 1 / leverage) : entryPrice * (1 + 1 / leverage)));
+        const unrealizedPnL = parseFloat(activePos.unrealizedPnl || activePos.pnl || 0);
+
+        db.portfolio.futures.positions[assetName] = {
+          side,
+          amount: size,
+          entryPrice,
+          leverage,
+          margin,
+          liquidationPrice,
+          unrealizedPnL
+        };
+      } else {
+        delete db.portfolio.futures.positions[assetName];
+      }
+    }
+    
+    // Recompute total unrealized futures PnL
+    let totalPnL = 0;
+    for (const k of Object.keys(db.portfolio.futures.positions)) {
+      totalPnL += db.portfolio.futures.positions[k].unrealizedPnL || 0;
+    }
+    db.portfolio.futures.unrealizedPnL = Number(totalPnL.toFixed(4));
+    
+    return true;
+  } catch (err) {
+    addLog('warning', `Failed to sync live futures state: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Execute a real swap/futures order on exchange
+ */
+async function executeLivePerpTrade(exchange, action, amountPct, leverage, currentPrice, assetName, db, symbol, reasoning = '') {
+  addLog('info', `Attempting Live Market Futures ${action} order on ${exchange.id} for ${symbol}...`);
+  const feePct = 0.0006; // Typical swap trading fee (0.06%)
+
+  try {
+    await ensureCoinbasePortfolio(exchange);
+    // 1. Load markets
+    await exchange.loadMarkets();
+
+    // 2. Fetch balance for futures
+    const quoteCurrency = symbol.split('/')[1]?.split(':')[0] || 'USDC';
+    const marginCurrency = quoteCurrency;
+
+    const balance = await exchange.fetchBalance({ type: 'future' });
+    const availableMargin = balance.free[marginCurrency] || balance.total[marginCurrency] || 0;
+    
+    if (availableMargin <= 5) {
+      throw new Error(`Insufficient isolated futures margin balance in ${marginCurrency} (${availableMargin.toFixed(2)}) on ${exchange.id}.`);
+    }
+
+    // Resolve futures symbol
+    const futSymbol = getFuturesSymbol(exchange, symbol);
+
+    // Set leverage on exchange
+    try {
+      if (typeof exchange.setLeverage === 'function') {
+        addLog('info', `Configuring leverage to ${leverage}x on ${exchange.id} for ${futSymbol}...`);
+        await exchange.setLeverage(leverage, futSymbol);
+      }
+    } catch (levErr) {
+      addLog('warning', `Failed to set leverage on exchange: ${levErr.message}. Continuing order placement...`);
+    }
+
+    // Determine target size
+    let allocatedMargin = availableMargin * (amountPct / 100);
+    if (allocatedMargin < 5.0 && availableMargin >= 5.0) {
+      allocatedMargin = 5.0;
+    }
+    if (allocatedMargin > availableMargin) {
+      allocatedMargin = availableMargin;
+    }
+
+    const targetNotional = allocatedMargin * leverage;
+    let sizeAmount = targetNotional / currentPrice;
+
+    // CCXT order side & params
+    let side = 'buy';
+    let params = { leverage: leverage };
+
+    if (action === 'BUY') {
+      side = 'buy';
+    } else if (action === 'SHORT') {
+      side = 'sell';
+    } else if (action === 'SELL') {
+      side = 'sell';
+      params.reduceOnly = true;
+    } else if (action === 'COVER') {
+      side = 'buy';
+      params.reduceOnly = true;
+    }
+
+    // If closing, we close a percentage of active position size
+    if (action === 'SELL' || action === 'COVER') {
+      let activePosSize = 0;
+      try {
+        const positions = await exchange.fetchPositions([futSymbol]);
+        const activePos = positions.find(p => p.symbol === futSymbol);
+        if (activePos) {
+          activePosSize = Math.abs(parseFloat(activePos.contracts || activePos.amount || 0));
+        }
+      } catch (posErr) {
+        addLog('warning', `Could not fetch live position size: ${posErr.message}. Estimating from DB.`);
+        const dbPos = db.portfolio.futures?.positions?.[assetName];
+        if (dbPos) {
+          activePosSize = dbPos.amount;
+        }
+      }
+
+      if (activePosSize <= 0) {
+        throw new Error(`No active live position found in ${futSymbol} to close.`);
+      }
+
+      sizeAmount = activePosSize * (amountPct / 100);
+    }
+
+    const sizeRounded = Number(exchange.amountToPrecision(futSymbol, sizeAmount));
+    if (sizeRounded <= 0) {
+      throw new Error(`Calculated contract size (${sizeAmount}) is too small for exchange rules.`);
+    }
+
+    addLog('info', `Placing Live Market Futures ${action.toUpperCase()} order on ${exchange.id} for ${sizeRounded} contracts of ${futSymbol}...`);
+
+    // Place the order
+    const order = await exchange.createOrder(futSymbol, 'market', side, sizeRounded, undefined, params);
+
+    // Sync database state from exchange
+    await syncLiveFuturesState(db, exchange, symbol, assetName, marginCurrency);
+    
+    // Construct trade details for logging
+    const orderPrice = order.price || currentPrice;
+    const orderAmount = order.amount || sizeRounded;
+    const orderTotal = order.cost || (orderAmount * orderPrice);
+    const orderFee = (order.fee && typeof order.fee.cost === 'number') ? order.fee.cost : (orderTotal * feePct);
+
+    const tradeDetails = {
+      timestamp: new Date().toISOString(),
+      symbol: symbol,
+      action: action,
+      price: orderPrice,
+      amount: orderAmount,
+      total: orderTotal,
+      fee: orderFee,
+      balanceAfter: db.portfolio.futures?.marginBalanceUSD || 0,
+      reasoning: reasoning,
+      mode: 'live',
+      tradeType: 'futures',
+      leverage: leverage
+    };
+
+    if (action === 'SELL' || action === 'COVER') {
+      const dbPos = db.portfolio.futures?.positions?.[assetName];
+      const entryPrice = dbPos ? dbPos.entryPrice : orderPrice;
+      const releasedMargin = dbPos ? (dbPos.margin * (amountPct / 100)) : (orderTotal / leverage);
+      let pnl = 0;
+      if (action === 'SELL') {
+        pnl = (orderPrice - entryPrice) * orderAmount;
+      } else {
+        pnl = (entryPrice - orderPrice) * orderAmount;
+      }
+      const netReturnVal = pnl - orderFee;
+      const netReturnPct = (pnl / (releasedMargin || 1)) * 100;
+      
+      tradeDetails.netReturnVal = Number(netReturnVal.toFixed(4));
+      tradeDetails.netReturnPct = Number(netReturnPct.toFixed(2));
+      tradeDetails.netReturn = `${netReturnVal >= 0 ? '+' : ''}${netReturnVal.toFixed(2)} USD (${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}%)`;
+    }
+
+    if (!db.trades) db.trades = [];
+    db.trades.unshift(tradeDetails);
+    writeDB(db);
+
+    return { success: true, trade: tradeDetails };
+
+  } catch (err) {
+    addLog('error', `Live Perpetual Trade Execution Failed: ${err.message}`);
+    throw err;
+  }
+}
+
+/**
  * Unified notifier that dispatches messages to Telegram (or SMS) and Discord,
  * and tracks the last sent message time to support silence breakers.
  */
@@ -1380,25 +1874,50 @@ async function runBotCycle() {
       return;
     }
 
-    if (settings.tradingMode === 'paper') {
-      // Execute simulated trade
-      const finalDb = readDB();
-      const result = executePaperTrade(analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, analysis.reasoning);
-      if (result.success) {
-        addLog('trade', `Paper Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
+    const isFutures = (settings.activeDesk === 'futures') || ['SHORT', 'COVER'].includes(analysis.decision);
+    const leverageVal = settings.defaultLeverage || 5;
+
+    if (isFutures) {
+      if (settings.tradingMode === 'paper') {
+        const finalDb = readDB();
+        const result = executePaperPerpTrade(analysis.decision, analysis.amount_pct, leverageVal, currentPrice, assetName, finalDb, analysis.reasoning);
+        if (result.success) {
+          addLog('trade', `Paper Futures Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} contracts of ${assetName} at $${currentPrice} with ${leverageVal}x leverage.`);
+        } else {
+          addLog('info', `Paper Futures Trade failed: ${result.message}`);
+        }
       } else {
-        addLog('info', `Paper Trade failed: ${result.message}`);
+        try {
+          const finalDb = readDB();
+          const result = await executeLivePerpTrade(exchange, analysis.decision, analysis.amount_pct, leverageVal, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning);
+          if (result.success) {
+            addLog('trade', `Live Futures Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} contracts of ${assetName} at $${result.trade.price} with ${leverageVal}x leverage.`);
+          }
+        } catch (liveErr) {
+          addLog('error', `Live Bot Futures Order Trigger Failed: ${liveErr.message}`);
+        }
       }
     } else {
-      // Real Live Trading Mode
-      try {
+      if (settings.tradingMode === 'paper') {
+        // Execute simulated trade
         const finalDb = readDB();
-        const result = await executeLiveTrade(exchange, analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning);
+        const result = executePaperTrade(analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, analysis.reasoning);
         if (result.success) {
-          addLog('trade', `Live Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
+          addLog('trade', `Paper Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
+        } else {
+          addLog('info', `Paper Trade failed: ${result.message}`);
         }
-      } catch (liveErr) {
-        addLog('error', `Live Bot Order Trigger Failed: ${liveErr.message}`);
+      } else {
+        // Real Live Trading Mode
+        try {
+          const finalDb = readDB();
+          const result = await executeLiveTrade(exchange, analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning);
+          if (result.success) {
+            addLog('trade', `Live Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
+          }
+        } catch (liveErr) {
+          addLog('error', `Live Bot Order Trigger Failed: ${liveErr.message}`);
+        }
       }
     }
   } catch (err) {
@@ -1483,6 +2002,13 @@ app.get('/api/status', async (req, res) => {
     // Sync balance: Throttle every 30s
     if (now - lastBalanceSyncTime > 30000) {
       db = await syncLiveBalance(db, exchange);
+      try {
+        const quoteCurrency = db.settings.selectedAsset.split('/')[1]?.split(':')[0] || 'USDC';
+        const assetName = db.settings.selectedAsset.split('/')[0];
+        await syncLiveFuturesState(db, exchange, db.settings.selectedAsset, assetName, quoteCurrency);
+      } catch (futSyncErr) {
+        console.error("Failed to sync live futures state for status:", futSyncErr.message);
+      }
       lastBalanceSyncTime = now;
     }
     
@@ -1607,7 +2133,12 @@ app.post('/api/reset-portfolio', (req, res) => {
   const db = readDB();
   db.portfolio = {
     balanceUSD: 10000.0,
-    positions: {}
+    positions: {},
+    futures: {
+      marginBalanceUSD: 100.0,
+      unrealizedPnL: 0.0,
+      positions: {}
+    }
   };
   db.trades = [];
   db.logs.unshift({
@@ -1807,29 +2338,49 @@ app.post('/api/bot/force-run', (req, res) => {
 
 // Manual buy/sell override
 app.post('/api/trade/manual', async (req, res) => {
-  const { action, amountPct, symbol } = req.body;
+  const { action, amountPct, symbol, tradeType, leverage } = req.body;
   const db = readDB();
   const settings = db.settings;
   const assetName = symbol.split('/')[0];
+  const isFutures = tradeType === 'futures' || ['SHORT', 'COVER'].includes(action);
+  const leverageVal = leverage || 5;
 
   try {
     const exchange = getExchangeInstance(settings);
     const ticker = await exchange.fetchTicker(symbol);
     const currentPrice = ticker.last || ticker.close;
 
-    if (settings.tradingMode === 'live') {
-      const finalDb = readDB();
-      const result = await executeLiveTrade(exchange, action, amountPct, currentPrice, assetName, finalDb, symbol, `REST API manual override ${action} command.`);
-      addLog('trade', `[MANUAL LIVE ORDER] Executed ${action} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
-      res.json({ success: true, trade: result.trade });
-    } else {
-      const finalDb = readDB();
-      const result = executePaperTrade(action, amountPct, currentPrice, assetName, finalDb, `REST API manual override ${action} command.`);
-      if (result.success) {
-        addLog('trade', `[MANUAL ORDER] Executed ${action} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
+    if (isFutures) {
+      if (settings.tradingMode === 'live') {
+        const finalDb = readDB();
+        const result = await executeLivePerpTrade(exchange, action, amountPct, leverageVal, currentPrice, assetName, finalDb, symbol, `REST API manual override perpetual ${action} command.`);
+        addLog('trade', `[MANUAL LIVE FUTURES ORDER] Executed perpetual ${action} ${result.trade.amount.toFixed(6)} contracts of ${assetName} at $${result.trade.price} with ${leverageVal}x leverage.`);
         res.json({ success: true, trade: result.trade });
       } else {
-        res.status(400).json({ success: false, message: result.message });
+        const finalDb = readDB();
+        const result = executePaperPerpTrade(action, amountPct, leverageVal, currentPrice, assetName, finalDb, `REST API manual override perpetual ${action} command.`);
+        if (result.success) {
+          addLog('trade', `[MANUAL FUTURES ORDER] Executed perpetual ${action} ${result.trade.amount.toFixed(6)} contracts of ${assetName} at $${currentPrice} with ${leverageVal}x leverage.`);
+          res.json({ success: true, trade: result.trade });
+        } else {
+          res.status(400).json({ success: false, message: result.message });
+        }
+      }
+    } else {
+      if (settings.tradingMode === 'live') {
+        const finalDb = readDB();
+        const result = await executeLiveTrade(exchange, action, amountPct, currentPrice, assetName, finalDb, symbol, `REST API manual override ${action} command.`);
+        addLog('trade', `[MANUAL LIVE ORDER] Executed ${action} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
+        res.json({ success: true, trade: result.trade });
+      } else {
+        const finalDb = readDB();
+        const result = executePaperTrade(action, amountPct, currentPrice, assetName, finalDb, `REST API manual override ${action} command.`);
+        if (result.success) {
+          addLog('trade', `[MANUAL ORDER] Executed ${action} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
+          res.json({ success: true, trade: result.trade });
+        } else {
+          res.status(400).json({ success: false, message: result.message });
+        }
       }
     }
   } catch (err) {
@@ -3248,10 +3799,20 @@ async function pollConditionalOrders() {
           const assetName = order.symbol.split('/')[0];
           
           let tradeRes;
-          if (settings.tradingMode === 'live') {
-            tradeRes = await executeLiveTrade(exchange, order.action, order.amountPct, currentPrice, assetName, finalDb, order.symbol, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+          const isFutures = order.tradeType === 'futures' || ['SHORT', 'COVER'].includes(order.action);
+          const leverageVal = order.leverage || 5;
+          if (isFutures) {
+            if (settings.tradingMode === 'live') {
+              tradeRes = await executeLivePerpTrade(exchange, order.action, order.amountPct, leverageVal, currentPrice, assetName, finalDb, order.symbol, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+            } else {
+              tradeRes = executePaperPerpTrade(order.action, order.amountPct, leverageVal, currentPrice, assetName, finalDb, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+            }
           } else {
-            tradeRes = executePaperTrade(order.action, order.amountPct, currentPrice, assetName, finalDb, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+            if (settings.tradingMode === 'live') {
+              tradeRes = await executeLiveTrade(exchange, order.action, order.amountPct, currentPrice, assetName, finalDb, order.symbol, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+            } else {
+              tradeRes = executePaperTrade(order.action, order.amountPct, currentPrice, assetName, finalDb, `Triggered conditional order ${order.id}. Reasoning: ${order.reasoning}`);
+            }
           }
           
           if (tradeRes.success) {
@@ -3397,7 +3958,14 @@ async function pollConditionalOrders() {
           try {
             const finalDb = readDB();
             const assetName = order.symbol.split('/')[0];
-            const tradeRes = executePaperTrade(order.action, order.amountPct, currentPrice, assetName, finalDb, `Simulated limit order ${order.id}. Setup reasoning: ${order.reasoning}`);
+            let tradeRes;
+            const isFutures = order.tradeType === 'futures' || ['SHORT', 'COVER'].includes(order.action);
+            const leverageVal = order.leverage || 5;
+            if (isFutures) {
+              tradeRes = executePaperPerpTrade(order.action, order.amountPct, leverageVal, currentPrice, assetName, finalDb, `Simulated limit order ${order.id}. Setup reasoning: ${order.reasoning}`);
+            } else {
+              tradeRes = executePaperTrade(order.action, order.amountPct, currentPrice, assetName, finalDb, `Simulated limit order ${order.id}. Setup reasoning: ${order.reasoning}`);
+            }
             if (tradeRes.success) {
               if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
                 const msg = `⚡ <b>PAPER LIMIT ORDER FILLED: ${order.action} ${order.symbol}</b> at <b>$${currentPrice.toLocaleString()}</b> (Size: ${order.amountPct}%).\n` +
@@ -3419,6 +3987,81 @@ async function pollConditionalOrders() {
             writeDB(freshDb);
           }
         }
+      }
+    }
+  }
+
+  // 3. Scan active virtual/paper perpetual positions for liquidations (in paper/sim mode)
+  if (db.portfolio.futures && db.portfolio.futures.positions) {
+    const activeFuturesAssets = Object.keys(db.portfolio.futures.positions);
+    for (const asset of activeFuturesAssets) {
+      const pos = db.portfolio.futures.positions[asset];
+      const selectedAssetSymbol = settings.selectedAsset; // e.g. XRP/USDC or XRP/USD
+      const currentPrice = prices[selectedAssetSymbol];
+      
+      if (currentPrice === undefined) continue;
+
+      let isLiquidated = false;
+      if (pos.side === 'LONG' && currentPrice <= pos.liquidationPrice) {
+        isLiquidated = true;
+      } else if (pos.side === 'SHORT' && currentPrice >= pos.liquidationPrice) {
+        isLiquidated = true;
+      }
+
+      if (isLiquidated) {
+        addLog('error', `🔥 [LIQUIDATION ALERT] Isolated margin liquidation triggered for ${pos.side} ${asset} position! Price: $${currentPrice} crossed barrier: $${pos.liquidationPrice}.`);
+        
+        const freshDb = readDB();
+        if (freshDb.portfolio.futures && freshDb.portfolio.futures.positions && freshDb.portfolio.futures.positions[asset]) {
+          const liquidatedPos = freshDb.portfolio.futures.positions[asset];
+          delete freshDb.portfolio.futures.positions[asset];
+          
+          const tradeDetails = {
+            timestamp: new Date().toISOString(),
+            symbol: selectedAssetSymbol,
+            action: liquidatedPos.side === 'LONG' ? 'SELL' : 'COVER',
+            price: currentPrice,
+            amount: liquidatedPos.amount,
+            total: liquidatedPos.amount * currentPrice,
+            fee: 0,
+            balanceAfter: freshDb.portfolio.futures.marginBalanceUSD,
+            reasoning: `🔥 FORCED MARGIN LIQUIDATION: Price crossed barrier $${liquidatedPos.liquidationPrice}`,
+            mode: settings.tradingMode,
+            tradeType: 'futures',
+            leverage: liquidatedPos.leverage,
+            netReturnVal: -liquidatedPos.margin,
+            netReturnPct: -100.00,
+            netReturn: `-100.00% (-$${liquidatedPos.margin.toFixed(2)} USD)`
+          };
+          
+          if (!freshDb.trades) freshDb.trades = [];
+          freshDb.trades.unshift(tradeDetails);
+          
+          let totalPnL = 0;
+          for (const k of Object.keys(freshDb.portfolio.futures.positions)) {
+            totalPnL += freshDb.portfolio.futures.positions[k].unrealizedPnL || 0;
+          }
+          freshDb.portfolio.futures.unrealizedPnL = Number(totalPnL.toFixed(4));
+          writeDB(freshDb);
+          
+          const alertMsg = `🔥 <b>FORCED MARGIN LIQUIDATION DETECTED</b> 🔥\n\n` +
+                           `Position: <b>${liquidatedPos.side} ${asset}</b> at ${liquidatedPos.leverage}x leverage.\n` +
+                           `Entry Price: <b>$${liquidatedPos.entryPrice}</b>\n` +
+                           `Liquidation Barrier: <b>$${liquidatedPos.liquidationPrice}</b>\n` +
+                           `Trigger Price: <b>$${currentPrice}</b>\n` +
+                           `Loss: <b>-$${liquidatedPos.margin.toFixed(2)} USD</b> (100% of isolated margin)`;
+          
+          if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
+            sendTelegramAlert(settings.telegramBotToken, settings.telegramChatId, alertMsg).catch(e => console.error(e));
+          }
+          if (settings.discordWebhookUrl) {
+            sendDiscordWebhook(settings.discordWebhookUrl, alertMsg).catch(e => console.error('Discord webhook error:', e.message));
+          }
+        }
+      } else {
+        const freshDb = readDB();
+        recalculatePaperFuturesPnL(freshDb, currentPrice, asset);
+        writeDB(freshDb);
       }
     }
   }
