@@ -885,28 +885,15 @@ function JarvisCore({ animating }) {
   );
 }
 
-function CognitiveAnalysis({ status }) {
+function CognitiveAnalysis({ status, activeDesk, handleToggleDesk }) {
   const latestDecision = status?.latestDecision;
-  
-  if (!latestDecision) {
-    return (
-      <div className="term-panel horizontal-analysis" style={{ height: '54px', display: 'flex', flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
-        <Activity size={18} style={{ color: 'var(--color-text-dark)' }} />
-        <span style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-          Awaiting Cognitive Input...
-        </span>
-      </div>
-    );
-  }
-
-  const { decision, confidence, amount_pct, timestamp, indicators } = latestDecision;
-  const confidencePct = confidence ? (confidence * 100).toFixed(0) : '0';
-  const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'N/A';
+  const timeStr = latestDecision?.timestamp ? new Date(latestDecision.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'N/A';
 
   // Get decision color
   let decisionColor = '#a1a1aa';
-  if (decision === 'BUY') decisionColor = 'var(--color-success)';
-  if (decision === 'SELL') decisionColor = 'var(--color-danger)';
+  if (latestDecision?.decision === 'BUY') decisionColor = 'var(--color-success)';
+  if (latestDecision?.decision === 'SELL') decisionColor = 'var(--color-danger)';
+  const confidencePct = latestDecision?.confidence ? (latestDecision.confidence * 100).toFixed(0) : '0';
 
   return (
     <div className="term-panel horizontal-analysis" style={{ height: '54px', display: 'flex', flexDirection: 'row', gap: '16px', flexShrink: 0, padding: '6px 12px', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -922,52 +909,111 @@ function CognitiveAnalysis({ status }) {
 
       {/* Metrics Row */}
       <div style={{ display: 'flex', gap: '12px', flex: 1, justifyContent: 'space-around', alignItems: 'center' }}>
-        {/* Decision */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>AI Decision</span>
-          <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: decisionColor }}>
-            {decision || 'HOLD'}
-          </span>
-        </div>
-        
-        {/* Confidence */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Confidence</span>
-          <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: '#fff' }}>
-            {confidencePct}%
-          </span>
-        </div>
+        {latestDecision ? (
+          <>
+            {/* Decision */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>AI Decision</span>
+              <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: decisionColor }}>
+                {latestDecision.decision || 'HOLD'}
+              </span>
+            </div>
+            
+            {/* Confidence */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Confidence</span>
+              <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: '#fff' }}>
+                {confidencePct}%
+              </span>
+            </div>
 
-        {/* Allocation */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Allocation</span>
-          <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: 'var(--color-primary)' }}>
-            {amount_pct || 0}%
-          </span>
-        </div>
+            {/* Allocation */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Allocation</span>
+              <span style={{ fontSize: '0.95rem', fontWeight: 'bold', color: 'var(--color-primary)' }}>
+                {latestDecision.amount_pct || 0}%
+              </span>
+            </div>
 
-        {/* Market Regime */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Market Regime</span>
-          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
-            {indicators?.marketRegime ? indicators.marketRegime.replace(/_/g, ' ') : 'N/A'}
-          </span>
-        </div>
+            {/* Market Regime */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>Market Regime</span>
+              <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
+                {latestDecision.indicators?.marketRegime ? latestDecision.indicators.marketRegime.replace(/_/g, ' ') : 'N/A'}
+              </span>
+            </div>
 
-        {/* ADX */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>ADX</span>
-          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
-            {indicators?.adx !== undefined && indicators?.adx !== null ? indicators.adx.toFixed(1) : 'N/A'}
-          </span>
-        </div>
+            {/* ADX */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>ADX</span>
+              <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
+                {latestDecision.indicators?.adx !== undefined && latestDecision.indicators?.adx !== null ? latestDecision.indicators.adx.toFixed(1) : 'N/A'}
+              </span>
+            </div>
 
-        {/* RVol */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>RVol</span>
-          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
-            {indicators?.rvol !== undefined && indicators?.rvol !== null ? `${indicators.rvol.toFixed(1)}x` : 'N/A'}
-          </span>
+            {/* RVol */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.3px' }}>RVol</span>
+              <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: '#fff' }}>
+                {latestDecision.indicators?.rvol !== undefined && latestDecision.indicators?.rvol !== null ? `${latestDecision.indicators.rvol.toFixed(1)}x` : 'N/A'}
+              </span>
+            </div>
+          </>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, justifyContent: 'center' }}>
+            <Activity size={14} style={{ color: 'var(--color-text-dark)', marginRight: '4px' }} />
+            <span style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Awaiting Bot Cycle / Cognitive Analysis...
+            </span>
+          </div>
+        )}
+
+        {/* Sliding Toggle Switch (Spot / Futures) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', paddingLeft: '12px', borderLeft: '1px solid rgba(255, 255, 255, 0.08)' }}>
+          <div className="toggle-switch-container" onClick={() => handleToggleDesk(activeDesk === 'spot' ? 'futures' : 'spot')} style={{
+            display: 'flex',
+            background: 'rgba(0,0,0,0.5)',
+            borderRadius: '20px',
+            padding: '3px',
+            border: '1px solid var(--border-color)',
+            position: 'relative',
+            width: '160px',
+            height: '24px',
+            alignItems: 'center',
+            cursor: 'pointer',
+            boxSizing: 'border-box'
+          }}>
+            <div className="toggle-slider" style={{
+              position: 'absolute',
+              width: '74px',
+              height: '16px',
+              background: activeDesk === 'futures' ? 'var(--color-danger)' : 'var(--color-secondary)',
+              boxShadow: activeDesk === 'futures' ? '0 0 6px rgba(236,72,153,0.3)' : 'none',
+              borderRadius: '12px',
+              transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+              left: activeDesk === 'futures' ? '83px' : '3px'
+            }} />
+            <span style={{
+              flex: 1,
+              textAlign: 'center',
+              fontSize: '0.6rem',
+              fontWeight: 'bold',
+              zIndex: 1,
+              color: activeDesk === 'spot' ? '#fff' : 'var(--color-text-dark)',
+              transition: 'color 0.2s',
+              userSelect: 'none'
+            }}>SPOT</span>
+            <span style={{
+              flex: 1,
+              textAlign: 'center',
+              fontSize: '0.6rem',
+              fontWeight: 'bold',
+              zIndex: 1,
+              color: activeDesk === 'futures' ? '#fff' : 'var(--color-text-dark)',
+              transition: 'color 0.2s',
+              userSelect: 'none'
+            }}>FUTURES</span>
+          </div>
         </div>
 
         {/* Bot Status (Running/Idle) */}
@@ -1974,93 +2020,9 @@ export default function App() {
       </aside>
 
       <div className="main-viewport" style={{ position: 'relative' }}>
-        {/* Global Desk Toggle HUD */}
-        <header className="glass-panel desk-toggle-hud" style={{
-          height: '52px',
-          minHeight: '52px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0 16px',
-          marginBottom: '10px',
-          background: 'rgba(21, 21, 21, 0.4)',
-          borderRadius: '12px',
-          border: '1px solid var(--border-color)',
-          flexShrink: 0,
-          boxSizing: 'border-box'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{
-              fontSize: '0.85rem',
-              fontWeight: 'bold',
-              letterSpacing: '0.5px',
-              textTransform: 'uppercase',
-              color: 'var(--color-primary)'
-            }}>
-              Aether {activeDesk === 'futures' ? 'Perpetual Futures' : 'Spot Trading'} Desk
-            </span>
-            <span style={{
-              fontSize: '0.62rem',
-              color: 'var(--color-secondary)',
-              background: 'rgba(255,255,255,0.04)',
-              padding: '2px 6px',
-              borderRadius: '4px',
-              border: '1px solid rgba(255,255,255,0.08)'
-            }}>
-              Phase 1 Engine
-            </span>
-          </div>
-          
-          {/* Sliding Toggle Switch */}
-          <div className="toggle-switch-container" onClick={() => handleToggleDesk(activeDesk === 'spot' ? 'futures' : 'spot')} style={{
-            display: 'flex',
-            background: 'rgba(0,0,0,0.5)',
-            borderRadius: '20px',
-            padding: '3px',
-            border: '1px solid var(--border-color)',
-            position: 'relative',
-            width: '200px',
-            height: '28px',
-            alignItems: 'center',
-            cursor: 'pointer',
-            boxSizing: 'border-box'
-          }}>
-            <div className="toggle-slider" style={{
-              position: 'absolute',
-              width: '94px',
-              height: '20px',
-              background: activeDesk === 'futures' ? 'var(--color-danger)' : 'var(--color-secondary)',
-              boxShadow: activeDesk === 'futures' ? '0 0 8px rgba(236,72,153,0.3)' : 'none',
-              borderRadius: '15px',
-              transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
-              left: activeDesk === 'futures' ? '101px' : '3px'
-            }} />
-            <span style={{
-              flex: 1,
-              textAlign: 'center',
-              fontSize: '0.68rem',
-              fontWeight: 'bold',
-              zIndex: 1,
-              color: activeDesk === 'spot' ? '#fff' : 'var(--color-text-dark)',
-              transition: 'color 0.2s',
-              userSelect: 'none'
-            }}>SPOT</span>
-            <span style={{
-              flex: 1,
-              textAlign: 'center',
-              fontSize: '0.68rem',
-              fontWeight: 'bold',
-              zIndex: 1,
-              color: activeDesk === 'futures' ? '#fff' : 'var(--color-text-dark)',
-              transition: 'color 0.2s',
-              userSelect: 'none'
-            }}>FUTURES</span>
-          </div>
-        </header>
-
       {activeTab === 'dashboard' && (
         <div className="aether-dashboard-wrapper fade-in">
-          <CognitiveAnalysis status={status} />
+          <CognitiveAnalysis status={status} activeDesk={activeDesk} handleToggleDesk={handleToggleDesk} />
           <div className="aether-terminal-cols">
             {/* Left Column: Account & Operations Control */}
             <div className="terminal-col-left">
