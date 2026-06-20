@@ -1253,53 +1253,84 @@ async function runBotCycle() {
     // --- AUTONOMOUS PLANNING & CONDITIONAL ORDER SCHEDULING ---
     const proposed = analysis.proposed_conditional_orders || [];
     const newlyScheduled = [];
-    if (proposed.length > 0) {
-      const dbForOrders = readDB();
-      if (!dbForOrders.conditionalOrders) {
-        dbForOrders.conditionalOrders = [];
+    const dbForOrders = readDB();
+    if (!dbForOrders.conditionalOrders) {
+      dbForOrders.conditionalOrders = [];
+    }
+
+    const symbol = settings.selectedAsset;
+
+    // 1. Separate existing orders into:
+    //    - existingAutos: autonomous orders for the current symbol (to be synced/diffed)
+    //    - otherOrders: manual orders or orders for other symbols (to be preserved untouched)
+    const existingAutos = [];
+    const otherOrders = [];
+    
+    for (const o of dbForOrders.conditionalOrders) {
+      if (o.symbol === symbol && o.id.startsWith('auto-')) {
+        existingAutos.push(o);
+      } else {
+        otherOrders.push(o);
+      }
+    }
+
+    const keptAutos = [];
+    const obsoleteAutos = [...existingAutos]; // starts with all, we will remove matched ones
+
+    // 2. Diff and sync proposed orders against existingAutos
+    for (const order of proposed) {
+      const action = order.action.toUpperCase();
+      const amountPct = Math.max(1, Math.min(100, Number(order.amount_pct) || 10));
+      const triggerType = order.trigger_type;
+      const triggerValue = Number(order.trigger_value) || 0;
+      const reasoning = order.reasoning || "Autonomous forward plan.";
+
+      if (!triggerValue || (triggerType !== 'price_below' && triggerType !== 'price_above')) {
+        continue;
       }
 
-      for (const order of proposed) {
-        const symbol = settings.selectedAsset;
-        const action = order.action;
-        const amountPct = Math.max(1, Math.min(100, Number(order.amount_pct) || 10));
-        const triggerType = order.trigger_type;
-        const triggerValue = Number(order.trigger_value) || 0;
-        const reasoning = order.reasoning || "Autonomous forward plan.";
+      // Check if there is an existing autonomous order that matches this proposal (within 0.5% tolerance)
+      const matchIdx = obsoleteAutos.findIndex(o => 
+        o.action === action &&
+        o.triggerType === triggerType &&
+        Math.abs(o.triggerValue - triggerValue) / triggerValue < 0.005
+      );
 
-        if (!triggerValue || (triggerType !== 'price_below' && triggerType !== 'price_above')) {
-          continue;
-        }
-
-        // Check if a similar order is already scheduled to prevent duplicates (within 0.5% tolerance)
-        const exists = dbForOrders.conditionalOrders.some(o => 
-          o.symbol === symbol &&
-          o.action === action &&
-          o.triggerType === triggerType &&
-          Math.abs(o.triggerValue - triggerValue) / triggerValue < 0.005
-        );
-
-        if (!exists) {
-          const crypto = require('crypto');
-          const orderId = 'auto-' + crypto.randomBytes(4).toString('hex');
-          const newOrder = {
-            id: orderId,
-            symbol,
-            action,
-            amountPct,
-            triggerType,
-            triggerValue,
-            executionType: 'virtual',
-            reasoning
-          };
-          dbForOrders.conditionalOrders.push(newOrder);
-          newlyScheduled.push(newOrder);
-        }
+      if (matchIdx !== -1) {
+        // Similar order already exists: keep it (preserves ID and prevents duplicate notification alerts)
+        const matchedOrder = obsoleteAutos.splice(matchIdx, 1)[0];
+        keptAutos.push(matchedOrder);
+      } else {
+        // No similar order exists: create a new one
+        const crypto = require('crypto');
+        const orderId = 'auto-' + crypto.randomBytes(4).toString('hex');
+        const newOrder = {
+          id: orderId,
+          symbol,
+          action,
+          amountPct,
+          triggerType,
+          triggerValue,
+          executionType: 'virtual',
+          reasoning
+        };
+        keptAutos.push(newOrder);
+        newlyScheduled.push(newOrder);
       }
+    }
 
+    // 3. Reconstruct conditionalOrders array
+    //    We combine preserved otherOrders + keptAutos (which includes kept existing ones and newly created ones)
+    //    Obsolete orders (remaining in obsoleteAutos) are deleted.
+    dbForOrders.conditionalOrders = [...otherOrders, ...keptAutos];
+
+    if (newlyScheduled.length > 0 || obsoleteAutos.length > 0) {
+      writeDB(dbForOrders);
       if (newlyScheduled.length > 0) {
-        writeDB(dbForOrders);
         addLog('info', `[AUTONOMOUS PLAN] Scheduled ${newlyScheduled.length} new conditional orders.`);
+      }
+      if (obsoleteAutos.length > 0) {
+        addLog('info', `[AUTONOMOUS PLAN] Cleared ${obsoleteAutos.length} obsolete conditional orders: ${obsoleteAutos.map(o => `${o.action} @ $${o.triggerValue}`).join(', ')}`);
       }
     }
 
