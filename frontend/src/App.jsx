@@ -671,17 +671,38 @@ function CustomTradingChart({ candleData, setCandleData, symbol, selectedAsset, 
 function formatChatMessage(text) {
   if (!text) return "";
   
-  // Basic markdown parser
-  let html = text
+  // 1. Temporarily replace valid HTML formatting tags with unique placeholders
+  const placeholders = [];
+  let placeholderId = 0;
+  
+  // Match standard formatting tags: b, i, u, code, h1-6, li, ul, ol, pre, strong, em, br
+  // Match link tags: a (with potential href/target attributes)
+  const allowedTagsRegex = /<\/?(?:b|i|u|code|h[1-6]|li|ul|ol|pre|strong|em|br\s*\/?)>|<a\s+[^>]*>|<\/a>/gi;
+  
+  let html = text.replace(allowedTagsRegex, (match) => {
+    const placeholder = `___HTML_TAG_PLACEHOLDER_${placeholderId}___`;
+    placeholders.push({ placeholder, tag: match });
+    placeholderId++;
+    return placeholder;
+  });
+  
+  // 2. Escape basic HTML characters
+  html = html
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
     
+  // 3. Restore the preserved HTML tags
+  for (const p of placeholders) {
+    html = html.replace(p.placeholder, p.tag);
+  }
+  
+  // 4. Apply Markdown rules
   // Bold **text**
   html = html.replace(/\*\*([\s\S]*?)\*\*/g, "<strong>$1</strong>");
   
   // Codeblocks ```javascript ... ```
-  html = html.replace(/```(?:[a-zA-Z]+)?([\s\S]*?)```/g, "<pre class='chat-code' style='background:rgba(0,0,0,0.3);padding:10px;border-radius:6px;overflow-x:auto;font-family:monospace;font-size:0.8rem;margin:8px 0;'><code>$1</code></pre>");
+  html = html.replace(/```(?:[a-zA-S]+)?([\s\S]*?)```/g, "<pre class='chat-code' style='background:rgba(0,0,0,0.3);padding:10px;border-radius:6px;overflow-x:auto;font-family:monospace;font-size:0.8rem;margin:8px 0;'><code>$1</code></pre>");
   
   // Inline code `code`
   html = html.replace(/`([^`]+)`/g, "<code class='chat-inline-code' style='background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:4px;font-family:monospace;font-size:0.85rem;'>$1</code>");

@@ -18,6 +18,42 @@ function escapeHTML(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function convertMarkdownToTelegramHTML(md) {
+  if (typeof md !== 'string') return md;
+  
+  let html = md;
+  
+  // 1. Escape basic HTML characters first
+  html = html
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+    
+  // 2. Convert bold: **text** or __text__ -> <b>text</b>
+  html = html.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+  html = html.replace(/__(.*?)__/g, '<b>$1</b>');
+  
+  // 3. Convert italic: *text* or _text_ -> <i>text</i>
+  html = html.replace(/\*(.*?)\*/g, '<i>$1</i>');
+  html = html.replace(/_([^_]+)_/g, '<i>$1</i>');
+  
+  // 4. Convert code blocks: ```lang ... ``` -> <pre>...</pre>
+  html = html.replace(/```(?:[a-zA-Z0-9]+)?\n([\s\S]*?)\n```/g, '<pre>$1</pre>');
+  
+  // 5. Convert inline code: `code` -> <code>code</code>
+  html = html.replace(/`(.*?)`/g, '<code>$1</code>');
+  
+  // 6. Convert headers: # text, ## text, ### text -> <b>text</b>
+  html = html.replace(/^### (.*?)$/gm, '<b>$1</b>');
+  html = html.replace(/^## (.*?)$/gm, '<b>$1</b>');
+  html = html.replace(/^# (.*?)$/gm, '<b>$1</b>');
+  
+  // 7. Convert bullet points: - item or * item -> • item
+  html = html.replace(/^[-\*] (.*?)$/gm, '• $1');
+  
+  return html;
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -1272,7 +1308,7 @@ async function runBotCycle() {
       const msg = `🚀 <b>AETHER BOT SIGNAL: ${analysis.decision} ${settings.selectedAsset}</b> at <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b> (Confidence: ${(analysis.confidence * 100).toFixed(0)}%, Size: ${analysis.amount_pct}%).\n` +
                   `📈 <b>Structure:</b> ${escapeHTML(analysis.market_structure)}.\n` +
                   `🛡️ <b>Key Zones:</b> Support $${analysis.support_level.toLocaleString()} | Resistance $${analysis.resistance_level.toLocaleString()} | Risk/Reward: ${analysis.risk_reward_ratio}.\n` +
-                  `🧠 <b>Rationale:</b> <i>"${escapeHTML(getFirstSentences(analysis.reasoning, 1))}"</i>`;
+                  `🧠 <b>Rationale:</b> <i>"${convertMarkdownToTelegramHTML(getFirstSentences(analysis.reasoning, 1))}"</i>`;
       await sendTelegramAndDiscordAlert(msg, settings);
     }
 
@@ -1280,12 +1316,12 @@ async function runBotCycle() {
     if (newlyScheduled.length > 0) {
       let planMsg = `🧠 <b>AETHER AUTONOMOUS PLAN: ${settings.selectedAsset}</b>\n` +
                     `Current Price: <b>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b>\n\n` +
-                    `<i>"${escapeHTML(analysis.forward_plan || analysis.reasoning)}"</i>\n\n` +
+                    `<i>"${convertMarkdownToTelegramHTML(analysis.forward_plan || analysis.reasoning)}"</i>\n\n` +
                     `📋 <b>Scheduled Multi-Move Actions:</b>\n`;
       
       newlyScheduled.forEach((o, idx) => {
         planMsg += `<b>Move ${idx + 1}: ${o.action} ${o.amountPct}%</b> when price is <b>${o.triggerType === 'price_below' ? 'below' : 'above'} $${o.triggerValue.toLocaleString()}</b>\n` +
-                   `  <i>Rationale: ${escapeHTML(o.reasoning)}</i>\n`;
+                   `  <i>Rationale: ${convertMarkdownToTelegramHTML(o.reasoning)}</i>\n`;
       });
       await sendTelegramAndDiscordAlert(planMsg, settings);
       addLog('info', `Autonomous plan announcement successfully dispatched to notification channels.`);
@@ -1301,7 +1337,7 @@ async function runBotCycle() {
                        `• Wave Count / Structure: <b>${escapeHTML(analysis.market_structure)}</b>\n` +
                        `• Market Regime: <b>${marketRegime}</b> (ADX: ${currentADX ? currentADX.toFixed(2) : 'N/A'})\n` +
                        `• Net Portfolio Value: <b>$${(db.portfolio.balanceUSD + (db.portfolio.positions[assetName]?.amount || 0) * currentPrice).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD</b>\n\n` +
-                       `💬 <b>My Outlook:</b>\n<i>"${escapeHTML(analysis.forward_plan || analysis.reasoning)}"</i>\n\n` +
+                       `💬 <b>My Outlook:</b>\n<i>"${convertMarkdownToTelegramHTML(analysis.forward_plan || analysis.reasoning)}"</i>\n\n` +
                        `I am actively scanning the charts every ${settings.botIntervalMin} minutes. Let me know if you want to adjust our rules, scale any positions, or change timeframes!`;
       
       await sendTelegramAndDiscordAlert(checkInMsg, settings);
@@ -3087,7 +3123,7 @@ async function handleTelegramCommand(text, token, chatId) {
         writeDB(freshDb);
         
         // Send final response back to Telegram
-        await sendResp(result.response);
+        await sendResp(convertMarkdownToTelegramHTML(result.response));
       } else {
         await sendResp(`❌ Aether processed the request but returned no response.`);
       }

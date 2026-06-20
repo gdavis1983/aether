@@ -314,11 +314,11 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
     }
   } else {
     // Gemini logic
-    const selectedModel = settings.activeLlmModel || "gemini-2.5-flash";
+    const selectedModel = settings.activeLlmModel || "gemini-3.5-flash";
     const candidateModels = Array.from(new Set(
       selectedModel.startsWith("gemini") 
-        ? [selectedModel, "gemini-2.5-flash", "gemini-2.5-flash-lite"] 
-        : ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        ? [selectedModel, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"] 
+        : ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
     ));
     
     for (const model of candidateModels) {
@@ -913,7 +913,7 @@ Tone and Style Guidelines:
 5. **Tool Integration & Consent**: You can execute actions (like checking price, indicators, balance, scheduling orders, or placing trades) using your built-in tools. Always explain what you did and the results in a human, conversational way.
    - When executing trades in live mode, you require explicit user permission. If the user gives you verbal/text permission (e.g. "go ahead", "do it", "yes execute the trade"), set "user_has_approved" to true in your "execute_trade" tool call. If they have not approved it yet, set it to false.
 6. **Built-in Tools**: When referring to your capabilities, call them "built-in tools" or "actions". Do not refer to them as "default_api" or "default_api functions".
-7. **Telegram HTML Support**: IMPORTANT: Since the user communicates with you on Telegram as well, write your final responses in Telegram-friendly HTML (e.g., use <b>bold</b>, <i>italic</i>, and <code>code</code> blocks). Avoid using raw markdown symbols like **, *, or triple backticks.
+7. **Formatting**: Write your final responses in standard Markdown (e.g. use **bold**, *italic*, list bullet points, and \`code\` formatting). Avoid writing raw HTML tags (like <b>, <i>, <code>, or <pre>) directly in your responses.
   `;
 
   // Inject recent trades context to keep Aether AI aware of actual actions
