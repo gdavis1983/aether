@@ -2002,12 +2002,14 @@ app.get('/api/status', async (req, res) => {
     // Sync balance: Throttle every 30s
     if (now - lastBalanceSyncTime > 30000) {
       db = await syncLiveBalance(db, exchange);
-      try {
-        const quoteCurrency = db.settings.selectedAsset.split('/')[1]?.split(':')[0] || 'USDC';
-        const assetName = db.settings.selectedAsset.split('/')[0];
-        await syncLiveFuturesState(db, exchange, db.settings.selectedAsset, assetName, quoteCurrency);
-      } catch (futSyncErr) {
-        console.error("Failed to sync live futures state for status:", futSyncErr.message);
+      if (db.settings.activeDesk === 'futures') {
+        try {
+          const quoteCurrency = db.settings.selectedAsset.split('/')[1]?.split(':')[0] || 'USDC';
+          const assetName = db.settings.selectedAsset.split('/')[0];
+          await syncLiveFuturesState(db, exchange, db.settings.selectedAsset, assetName, quoteCurrency);
+        } catch (futSyncErr) {
+          console.error("Failed to sync live futures state for status:", futSyncErr.message);
+        }
       }
       lastBalanceSyncTime = now;
     }
