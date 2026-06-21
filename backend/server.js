@@ -4255,5 +4255,22 @@ if (fs.existsSync(frontendDistPath)) {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
+  const os = require('os');
+  let localIp = 'localhost';
+  try {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          localIp = iface.address;
+          break;
+        }
+      }
+      if (localIp !== 'localhost') break;
+    }
+  } catch (e) {
+    // ignore
+  }
   console.log(`Backend server running on http://localhost:${PORT}`);
+  console.log(`To access on your phone, open: http://${localIp}:${PORT}`);
 });
