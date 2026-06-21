@@ -28,6 +28,72 @@ import {
 } from 'lucide-react';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers } from 'lightweight-charts';
 
+const renderLogMessage = (message) => {
+  if (typeof message !== 'string') return <span>{String(message)}</span>;
+  
+  if (message.startsWith('[STRATEGIST]')) {
+    const content = message.replace('[STRATEGIST]', '').trim();
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+        <span style={{
+          background: 'rgba(168, 85, 247, 0.2)',
+          color: '#c084fc',
+          border: '1px solid rgba(168, 85, 247, 0.3)',
+          padding: '1px 6px',
+          borderRadius: '4px',
+          fontSize: '0.62rem',
+          fontWeight: 'bold',
+          letterSpacing: '0.5px',
+          textTransform: 'uppercase',
+          fontFamily: 'var(--font-mono)'
+        }}>Strategist</span>
+        <span style={{ color: '#e9d5ff' }}>{content}</span>
+      </span>
+    );
+  }
+  if (message.startsWith('[AUDITOR]')) {
+    const content = message.replace('[AUDITOR]', '').trim();
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+        <span style={{
+          background: 'rgba(249, 115, 22, 0.2)',
+          color: '#fb923c',
+          border: '1px solid rgba(249, 115, 22, 0.3)',
+          padding: '1px 6px',
+          borderRadius: '4px',
+          fontSize: '0.62rem',
+          fontWeight: 'bold',
+          letterSpacing: '0.5px',
+          textTransform: 'uppercase',
+          fontFamily: 'var(--font-mono)'
+        }}>Auditor</span>
+        <span style={{ color: '#ffedd5' }}>{content}</span>
+      </span>
+    );
+  }
+  if (message.startsWith('[CONSENSUS]')) {
+    const content = message.replace('[CONSENSUS]', '').trim();
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+        <span style={{
+          background: 'rgba(34, 197, 94, 0.2)',
+          color: '#4ade80',
+          border: '1px solid rgba(34, 197, 94, 0.3)',
+          padding: '1px 6px',
+          borderRadius: '4px',
+          fontSize: '0.62rem',
+          fontWeight: 'bold',
+          letterSpacing: '0.5px',
+          textTransform: 'uppercase',
+          fontFamily: 'var(--font-mono)'
+        }}>Consensus</span>
+        <span style={{ color: '#dcfce7', fontWeight: 'bold' }}>{content}</span>
+      </span>
+    );
+  }
+  return <span>{message}</span>;
+};
+
 const BACKEND_URL = `http://${window.location.hostname}:5000`;
 
 // Simple indicator calculations for UI overlay
@@ -1101,7 +1167,10 @@ export default function App() {
     atrStopEnabled: true,
     atrStopMultiplier: 2.0,
     newsSentimentEnabled: false,
-    maxPositionAllocationPct: 75
+    maxPositionAllocationPct: 75,
+    obsidianVaultPath: '',
+    dualLlmEnabled: false,
+    auditorModel: 'gemini-2.5-flash'
   });
 
   // Manual trade form state
@@ -1113,6 +1182,31 @@ export default function App() {
 
   const [activeDesk, setActiveDesk] = useState('spot');
   const [manualLeverage, setManualLeverage] = useState(5);
+
+  const [obsidianVerificationResult, setObsidianVerificationResult] = useState(null);
+  const [verifyingObsidianPath, setVerifyingObsidianPath] = useState(false);
+
+  const handleVerifyObsidianPath = async () => {
+    if (!settingsForm.obsidianVaultPath) {
+      setObsidianVerificationResult({ success: false, message: "Path is empty." });
+      return;
+    }
+    setVerifyingObsidianPath(true);
+    setObsidianVerificationResult(null);
+    try {
+      const response = await fetch('/api/settings/verify-obsidian-path', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: settingsForm.obsidianVaultPath })
+      });
+      const data = await response.json();
+      setObsidianVerificationResult(data);
+    } catch (err) {
+      setObsidianVerificationResult({ success: false, message: `Error: ${err.message}` });
+    } finally {
+      setVerifyingObsidianPath(false);
+    }
+  };
 
   const handleToggleDesk = async (desk) => {
     setActiveDesk(desk);
@@ -2885,7 +2979,7 @@ export default function App() {
                 <div className="log-terminal" style={{ flex: 1, minHeight: 0, background: 'rgba(0, 0, 0, 0.2)', border: '1px solid rgba(255,255,255,0.02)', borderRadius: '8px', padding: '8px' }}>
                   {logs.slice(0, 30).reverse().map((log, idx) => (
                     <div key={idx} className={`log-entry ${log.type}`} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px', paddingBottom: '6px', borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
-                      <span className="log-message" style={{ width: '100%', wordBreak: 'break-word', fontSize: '0.72rem' }}>{log.message}</span>
+                      <span className="log-message" style={{ width: '100%', wordBreak: 'break-word', fontSize: '0.72rem' }}>{renderLogMessage(log.message)}</span>
                       <span className="log-time" style={{ fontSize: '0.58rem', marginTop: '1px' }}>{safeFormatDate(log.timestamp, true)}</span>
                     </div>
                   ))}
@@ -3390,7 +3484,7 @@ export default function App() {
             {logs.slice().reverse().map((log, idx) => (
               <div key={idx} className={`log-entry ${log.type}`}>
                 <span className="log-time">{safeFormatDate(log.timestamp)}</span>
-                <span className="log-message">{log.message}</span>
+                <span className="log-message">{renderLogMessage(log.message)}</span>
               </div>
             ))}
           </div>
@@ -3814,6 +3908,91 @@ export default function App() {
                     </div>
                   )}
                 </div>
+              </div>
+              {/* Obsidian Vault Integration Panel */}
+              <div className="form-group" style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255, 255, 255, 0.05)', display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '12px' }}>
+                <h3 style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--color-secondary)', textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  📓 Obsidian Journal & Rule Sync
+                </h3>
+                
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <label className="form-label">Obsidian Vault Absolute Path</label>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <input 
+                      type="text" 
+                      className="form-input"
+                      placeholder="e.g. C:\Users\Username\Obsidian\TradingVault"
+                      value={settingsForm.obsidianVaultPath || ''}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, obsidianVaultPath: e.target.value })}
+                      style={{ flex: 1 }}
+                    />
+                    <button 
+                      type="button" 
+                      className="btn btn-secondary" 
+                      onClick={handleVerifyObsidianPath}
+                      disabled={verifyingObsidianPath}
+                      style={{ padding: '6px 16px', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
+                    >
+                      {verifyingObsidianPath ? 'Verifying...' : 'Verify Path'}
+                    </button>
+                  </div>
+                  <span className="text-muted">Aether will auto-log trade outcomes to <code>/Trades/</code>, record daily check-ins to <code>/Daily Notes/</code>, and sync custom trading rules from <code>Aether_Rules.md</code>.</span>
+                  
+                  {obsidianVerificationResult && (
+                    <div style={{ 
+                      marginTop: '6px', 
+                      padding: '8px 12px', 
+                      borderRadius: '6px', 
+                      fontSize: '0.75rem',
+                      background: obsidianVerificationResult.success ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                      color: obsidianVerificationResult.success ? '#4ade80' : '#f87171',
+                      border: `1px solid ${obsidianVerificationResult.success ? 'rgba(34, 197, 94, 0.2)' : 'rgba(239, 68, 68, 0.2)'}`
+                    }}>
+                      {obsidianVerificationResult.success ? '✅ ' : '❌ '} {obsidianVerificationResult.message}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Dual-LLM Consensus Debate Engine Panel */}
+              <div className="form-group" style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(255, 255, 255, 0.05)', display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '12px' }}>
+                <h3 style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--color-secondary)', textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  🤖 Dual-LLM Consensus Debate Engine
+                </h3>
+                
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <input 
+                      type="checkbox" 
+                      id="dualLlmEnabled"
+                      checked={settingsForm.dualLlmEnabled}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, dualLlmEnabled: e.target.checked })}
+                      style={{ accentColor: 'var(--color-secondary)', cursor: 'pointer', width: '16px', height: '16px' }}
+                    />
+                    <label htmlFor="dualLlmEnabled" style={{ fontWeight: '600', fontSize: '0.8rem', color: '#fff', cursor: 'pointer' }}>
+                      Enable "Iron Sharpens Iron" Risk Auditor Debate Loop
+                    </label>
+                  </div>
+                  <span className="text-muted">Runs strategist decisions through a cynical Risk Auditor model to challenge analysis flaws before trade execution.</span>
+                </div>
+
+                {settingsForm.dualLlmEnabled && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', paddingLeft: '24px', animation: 'fadeIn 0.2s ease' }}>
+                    <label className="form-label">Risk Auditor Model</label>
+                    <select 
+                      className="form-select"
+                      value={settingsForm.auditorModel || 'gemini-2.5-flash'}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, auditorModel: e.target.value })}
+                      style={{ width: '100%' }}
+                    >
+                      <option value="gemini-2.5-flash">Gemini 2.5 Flash (Fast, Cost-efficient)</option>
+                      <option value="gemini-2.5-pro">Gemini 2.5 Pro (Ultra thorough reasoning)</option>
+                      <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                      <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+                    </select>
+                    <span className="text-muted">Aether will use this model for the adversarial Risk Auditor round. The Resolver will use the main active model for final consensus logic.</span>
+                  </div>
+                )}
               </div>
 
               {/* Signal Alerts Dispatcher Configurations */}

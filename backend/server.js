@@ -128,7 +128,10 @@ const defaultSettings = {
   newsSentimentEnabled: false,
   maxPositionAllocationPct: 75,
   activeDesk: "spot",
-  defaultLeverage: 5
+  defaultLeverage: 5,
+  obsidianVaultPath: "",
+  dualLlmEnabled: false,
+  auditorModel: "gemini-2.5-flash"
 };
 
 // Bot interval runtime state
@@ -203,6 +206,134 @@ function writeDB(data) {
     console.error("Error writing database:", err);
   }
 }
+
+function writeToObsidianVault(subdir, filename, content) {
+  try {
+    const db = readDB();
+    const vaultPath = db.settings?.obsidianVaultPath;
+    if (!vaultPath) return; // Silent return if path is not configured
+
+    const targetDir = path.join(vaultPath, subdir);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    const filePath = path.join(targetDir, filename);
+    fs.writeFileSync(filePath, content, 'utf8');
+    console.log(`[OBSIDIAN] Wrote note ${filename} inside subdirectory ${subdir}.`);
+  } catch (err) {
+    console.error("[OBSIDIAN] Failed to write to vault:", err.message);
+  }
+}
+
+function syncRulesFromObsidian() {
+  try {
+    const db = readDB();
+    const vaultPath = db.settings?.obsidianVaultPath;
+    if (!vaultPath) return;
+
+    const rulesFile = path.join(vaultPath, 'Aether_Rules.md');
+    if (!fs.existsSync(rulesFile)) {
+      const currentRules = db.customTradingRules || [];
+      let initialContent = `# 🤖 Aether Custom Trading Rules\n\n`;
+      initialContent += `Edit this file directly in Obsidian. Aether will sync rules on every tick.\n\n`;
+      if (currentRules.length > 0) {
+        currentRules.forEach(r => {
+          initialContent += `- ${r}\n`;
+        });
+      } else {
+        initialContent += `- We are strictly holding our XRP position long-term and dollar-cost averaging (DCA) through downturns.\n`;
+      }
+      fs.writeFileSync(rulesFile, initialContent, 'utf8');
+      console.log(`[OBSIDIAN] Created initial Aether_Rules.md file in vault.`);
+      return;
+    }
+
+    const content = fs.readFileSync(rulesFile, 'utf8');
+    const lines = content.split('\n');
+    const newRules = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('-') || trimmed.startsWith('*')) {
+        const ruleText = trimmed.substring(1).trim();
+        if (ruleText) {
+          newRules.push(ruleText);
+        }
+      }
+    }
+
+    if (newRules.length > 0) {
+      const rulesChanged = JSON.stringify(db.customTradingRules) !== JSON.stringify(newRules);
+      if (rulesChanged) {
+        db.customTradingRules = newRules;
+        writeDB(db);
+        console.log(`[OBSIDIAN] Synced ${newRules.length} rules from vault.`);
+      }
+    }
+  } catch (err) {
+    console.error("[OBSIDIAN] Failed to sync rules from vault:", err.message);
+  }
+}
+
+function logCheckInToObsidian(analysis, marketRegime, currentPrice, assetName, db) {
+  const date = new Date();
+  const dateString = date.toISOString().split('T')[0]; // YYYY-MM-DD
+  const filename = `${dateString}_Aether_CheckIn.md`;
+  
+  let markdown = `# ☕ Aether Daily Strategist Check-In: ${db.settings?.selectedAsset || 'Asset'}
+- **Timestamp**: ${date.toLocaleString()}
+- **Market Price**: $${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+- **Market Regime**: [[${marketRegime}]]
+- **Net Portfolio Value**: $${(db.portfolio?.balanceUSD + (db.portfolio?.positions?.[assetName]?.amount || 0) * currentPrice).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD
+
+## 📈 Wave Count / Structure
+${analysis.market_structure}
+
+## 🧠 Brain Outlook & Rationale
+${analysis.forward_plan || analysis.reasoning}
+
+---
+*Links: [[Daily Notes]] | [[${dateString}]] | [[${assetName} Strategy]]*
+`;
+  writeToObsidianVault("Daily Notes", filename, markdown);
+}
+
+function logTradeToObsidian(trade, assetName) {
+  const date = new Date(trade.timestamp);
+  const dateString = date.toISOString().split('T')[0]; // YYYY-MM-DD
+  const filename = `Trade_${assetName}_${trade.action}_${date.getTime()}.md`;
+  
+  let markdown = `# ⚡ Trade Execution: ${trade.action} ${trade.symbol}
+
+- **Date**: ${date.toLocaleString()}
+- **Asset**: [[${assetName}]]
+- **Execution Mode**: \`${trade.mode}\`
+- **Trading Desk**: \`${trade.tradeType || 'spot'}\`
+
+## 📊 Trade Metrics
+- **Action**: ${trade.action}
+- **Price**: $${trade.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+- **Size/Contracts**: ${trade.amount.toFixed(6)}
+- **Total Value**: $${trade.total.toFixed(2)} USD
+- **Fee Charged**: $${trade.fee.toFixed(4)} USD
+- **Post-Trade Balance/Collateral**: $${trade.balanceAfter.toFixed(2)} USD
+${trade.leverage ? `- **Leverage**: ${trade.leverage}x` : ''}
+
+${trade.netReturnVal !== undefined ? `
+## 💵 Trade Performance (Realized Returns)
+- **Net Return**: $${trade.netReturnVal.toFixed(2)} USD
+- **Return Pct**: ${trade.netReturnPct.toFixed(2)}%
+` : ''}
+
+## 🧠 Setup Rationale & Invalidation
+${trade.reasoning}
+
+---
+*Links: [[Trade History]] | [[${dateString}]] | [[${assetName} Strategy]]*
+`;
+  writeToObsidianVault("Trades", filename, markdown);
+}
+
 
 // Write to system logs
 function addLog(type, message) {
@@ -642,6 +773,7 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
   if (tradeDetails) {
     db.trades.unshift(tradeDetails);
     writeDB(db);
+    logTradeToObsidian(tradeDetails, assetName);
     return { success: true, trade: tradeDetails };
   }
 
@@ -844,6 +976,7 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
       }
 
       writeDB(db);
+      logTradeToObsidian(orderDetails, assetName);
       return { success: true, trade: orderDetails };
     }
   } catch (err) {
@@ -1036,6 +1169,7 @@ function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetN
     // Recompute unrealized PnL and total portfolio values
     recalculatePaperFuturesPnL(db, currentPrice, assetName);
     writeDB(db);
+    logTradeToObsidian(tradeDetails, assetName);
     return { success: true, trade: tradeDetails };
   }
 
@@ -1317,6 +1451,7 @@ async function executeLivePerpTrade(exchange, action, amountPct, leverage, curre
     if (!db.trades) db.trades = [];
     db.trades.unshift(tradeDetails);
     writeDB(db);
+    logTradeToObsidian(tradeDetails, assetName);
 
     return { success: true, trade: tradeDetails };
 
@@ -1380,6 +1515,7 @@ async function sendTelegramAndDiscordAlert(msg, settings) {
  * Main trading bot ticker cycle
  */
 async function runBotCycle() {
+  syncRulesFromObsidian();
   let db = readDB();
   const settings = db.settings;
 
@@ -1716,7 +1852,7 @@ async function runBotCycle() {
 
     // Call Brain (LLM)
     addLog('info', "Sending data pack to Gemini Brain for trade analysis...");
-    const analysis = await getTradingDecision(apiKey, marketData, db.portfolio, settings, (msg) => addLog('warning', msg));
+    const analysis = await getTradingDecision(apiKey, marketData, db.portfolio, settings, (msg, type = 'warning') => addLog(type, msg));
     
     // Save latest AI diagnostic data to database
     const freshDb = readDB();
@@ -1867,6 +2003,7 @@ async function runBotCycle() {
       
       await sendTelegramAndDiscordAlert(checkInMsg, settings);
       addLog('info', `Silence-breaker daily strategist check-in dispatched.`);
+      logCheckInToObsidian(analysis, marketRegime, currentPrice, assetName, db);
     }
 
     if (analysis.decision === 'HOLD') {
@@ -2088,6 +2225,27 @@ app.post('/api/settings', (req, res) => {
   startTelegramCommandListener();
 
   res.json({ success: true, settings: db.settings });
+});
+
+app.post('/api/settings/verify-obsidian-path', (req, res) => {
+  const { path: vaultPath } = req.body;
+  if (!vaultPath) {
+    return res.json({ success: false, message: "Path is empty." });
+  }
+  try {
+    if (fs.existsSync(vaultPath)) {
+      const stats = fs.statSync(vaultPath);
+      if (stats.isDirectory()) {
+        return res.json({ success: true, message: "Valid directory path found!" });
+      } else {
+        return res.json({ success: false, message: "Path exists but is not a directory." });
+      }
+    } else {
+      return res.json({ success: false, message: "Path does not exist on this machine." });
+    }
+  } catch (err) {
+    return res.json({ success: false, message: `Error verifying path: ${err.message}` });
+  }
 });
 
 // Get operations manual content
@@ -3916,6 +4074,7 @@ async function pollConditionalOrders() {
             
             finalDb.trades.unshift(tradeDetails);
             writeDB(finalDb);
+            logTradeToObsidian(tradeDetails, assetName);
             
             // Send Telegram alert
             if (settings.notificationType === 'telegram' && settings.telegramBotToken && settings.telegramChatId) {
@@ -4045,6 +4204,7 @@ async function pollConditionalOrders() {
           }
           freshDb.portfolio.futures.unrealizedPnL = Number(totalPnL.toFixed(4));
           writeDB(freshDb);
+          logTradeToObsidian(tradeDetails, asset);
           
           const alertMsg = `🔥 <b>FORCED MARGIN LIQUIDATION DETECTED</b> 🔥\n\n` +
                            `Position: <b>${liquidatedPos.side} ${asset}</b> at ${liquidatedPos.leverage}x leverage.\n` +

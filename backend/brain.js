@@ -68,6 +68,138 @@ async function getClaudeDecision(model, apiKey, promptText) {
   return resJson.content[0].text.trim();
 }
 
+async function queryModel(provider, model, apiKey, systemInstruction, userPrompt, responseSchema, settings) {
+  if (provider === "openai") {
+    const url = "https://api.openai.com/v1/chat/completions";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: userPrompt }
+        ],
+        response_format: { type: "json_object" }
+      })
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`OpenAI API Error (${response.status}): ${errText}`);
+    }
+    const resJson = await response.json();
+    return resJson.choices[0].message.content.trim();
+  } else if (provider === "claude") {
+    const url = "https://api.anthropic.com/v1/messages";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: model,
+        max_tokens: 2000,
+        system: systemInstruction,
+        messages: [
+          { role: "user", content: userPrompt }
+        ]
+      })
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Claude API Error (${response.status}): ${errText}`);
+    }
+    const resJson = await response.json();
+    return resJson.content[0].text.trim();
+  } else {
+    // Gemini logic
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const payload = {
+      contents: [{
+        parts: [{ text: userPrompt }]
+      }],
+      systemInstruction: {
+        parts: [{ text: systemInstruction }]
+      }
+    };
+    if (responseSchema) {
+      payload.generationConfig = {
+        responseMimeType: "application/json",
+        responseSchema: responseSchema
+      };
+    }
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Gemini API Error (${response.status}): ${errText}`);
+    }
+    const resJson = await response.json();
+    if (!resJson.candidates || resJson.candidates.length === 0) {
+      throw new Error("No response candidates returned from Gemini.");
+    }
+    return resJson.candidates[0].content.parts[0].text.trim();
+  }
+}
+
+async function queryModelWithFallback(provider, model, apiKey, systemInstruction, userPrompt, responseSchema, settings, logCallback) {
+  let resultText = "";
+  let lastError = null;
+
+  if (provider === "openai" || provider === "claude") {
+    try {
+      resultText = await queryModel(provider, model, apiKey, systemInstruction, userPrompt, responseSchema, settings);
+    } catch (err) {
+      lastError = err;
+    }
+  } else {
+    // Gemini fallback logic
+    const candidateModels = Array.from(new Set(
+      model.startsWith("gemini") 
+        ? [model, "gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"] 
+        : ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+    ));
+    
+    for (const curModel of candidateModels) {
+      let backoffMs = 1000;
+      const attempts = 2;
+
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 35000);
+
+          resultText = await queryModel(provider, curModel, apiKey, systemInstruction, userPrompt, responseSchema, settings);
+          clearTimeout(timeoutId);
+          break;
+        } catch (err) {
+          lastError = err;
+          if (logCallback) {
+            logCallback(`Gemini model ${curModel} (attempt ${attempt}/${attempts}) failed: ${err.message}`, "warning");
+          }
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          backoffMs *= 2;
+        }
+      }
+      if (resultText) break;
+    }
+  }
+
+  if (!resultText) {
+    throw lastError || new Error(`All candidate models for provider ${provider} failed to return a response.`);
+  }
+
+  return resultText;
+}
+
 async function getTradingDecision(apiKey, marketData, portfolio, settings, logWarning) {
   const provider = settings.activeLlmProvider || "gemini";
   let activeApiKey = apiKey;
@@ -83,6 +215,7 @@ async function getTradingDecision(apiKey, marketData, portfolio, settings, logWa
     throw new Error(`API Key for active provider (${provider}) is missing. Please configure it in Settings.`);
   }
 
+  const logCallback = typeof logWarning === 'function' ? logWarning : null;
   const { ticker, indicators, recentCandles, macroContext } = marketData;
   const currentPrice = ticker.close;
   const assetName = settings.selectedAsset.split("/")[0];
@@ -258,12 +391,22 @@ You are executing a TOP-DOWN trading strategy.
     console.error("Failed to load custom trading rules for prompt context:", err.message);
   }
 
-  const promptText = `
+  const strategistSystemInstruction = `You are a master algorithmic cryptocurrency trader specializing in Elliott Wave Theory, Fibonacci Retracements, and momentum analysis. Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`;
+
+  const strategistPrompt = `
 === STRATEGY PROMPT RULES & GUIDELINES ===
 ${settings.customPrompt}
 
 ${stratInstructions}
 ${customRulesInstruction}
+
+=== 3D COGNITIVE THINKING SPACE ===
+You must process and structure your analysis inside a 3-Dimensional Cognitive Space, rather than standard linear thinking:
+- Axis X: Structural/EWT & Memory Space (evaluate the macro cycle, Elliott wave count, Fibonacci retracements, and performance history to locate where we are in structural coordinate space).
+- Axis Y: Quantitative/Momentum Space (evaluate micro technical indicators, SMA crossovers, RSI overbought/oversold, ADX trend regimes, MACD hist, RVol, and Awesome Oscillator to locate velocity and direction).
+- Axis Z: Risk/Consensus Space (evaluate invalidation points, isolated futures leverage, isolated margin ratios, size allocation caps, and adversarial consensus critiques to locate trade validity).
+
+Your output "reasoning" MUST begin with a clearly structured "[3D COGNITIVE CO-ORDINATES]" mapping detailing the coordinates of this trade on Axis X, Axis Y, and Axis Z.
 
 === MANDATORY SYSTEM RULES ===
 1. **Chain-of-Thought Decision Checklist**:
@@ -297,156 +440,79 @@ INSTRUCTIONS FOR RETURNING EXTRA JSON SCHEMA FIELDS:
 Remember: Output ONLY valid raw JSON matching the required schema. Do not include markdown codeblocks or extra text.
 `;
 
-  let resultText = "";
-  let lastError = null;
-
-  if (provider === "openai") {
-    try {
-      resultText = await getOpenAiDecision(settings.activeLlmModel || "gpt-4o", activeApiKey, promptText);
-    } catch (err) {
-      lastError = err;
-    }
-  } else if (provider === "claude") {
-    try {
-      resultText = await getClaudeDecision(settings.activeLlmModel || "claude-3-5-sonnet-latest", activeApiKey, promptText);
-    } catch (err) {
-      lastError = err;
-    }
-  } else {
-    // Gemini logic
-    const selectedModel = settings.activeLlmModel || "gemini-3.5-flash";
-    const candidateModels = Array.from(new Set(
-      selectedModel.startsWith("gemini") 
-        ? [selectedModel, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"] 
-        : ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
-    ));
-    
-    for (const model of candidateModels) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${activeApiKey}`;
-      let backoffMs = 1000;
-      const attempts = 2; // Try each model up to 2 times
-
-      for (let attempt = 1; attempt <= attempts; attempt++) {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 35000); // 35-second timeout
-
-          const response = await fetch(url, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              contents: [{
-                parts: [{
-                  text: promptText
-                }]
-              }],
-              generationConfig: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                  type: "OBJECT",
-                  properties: {
-                    decision: {
-                      type: "STRING",
-                      enum: ["BUY", "SELL", "HOLD", "SHORT", "COVER"]
-                    },
-                    reasoning: {
-                      type: "STRING"
-                    },
-                    confidence: {
-                      type: "NUMBER"
-                    },
-                    amount_pct: {
-                      type: "INTEGER"
-                    },
-                    market_structure: {
-                      type: "STRING"
-                    },
-                    support_level: {
-                      type: "NUMBER"
-                    },
-                    resistance_level: {
-                      type: "NUMBER"
-                    },
-                    news_sentiment_score: {
-                      type: "INTEGER"
-                    },
-                    risk_reward_ratio: {
-                      type: "NUMBER"
-                    },
-                    forward_plan: {
-                      type: "STRING"
-                    },
-                    proposed_conditional_orders: {
-                      type: "ARRAY",
-                      items: {
-                        type: "OBJECT",
-                        properties: {
-                          action: { type: "STRING", enum: ["BUY", "SELL", "SHORT", "COVER"] },
-                          amount_pct: { type: "INTEGER" },
-                          trigger_type: { type: "STRING", enum: ["price_below", "price_above"] },
-                          trigger_value: { type: "NUMBER" },
-                          reasoning: { type: "STRING" }
-                        },
-                        required: ["action", "amount_pct", "trigger_type", "trigger_value", "reasoning"]
-                      }
-                    }
-                  },
-                  required: [
-                    "decision", "reasoning", "confidence", "amount_pct", 
-                    "market_structure", "support_level", "resistance_level", 
-                    "news_sentiment_score", "risk_reward_ratio", "forward_plan", 
-                    "proposed_conditional_orders"
-                  ]
-                }
-              }
-            }),
-            signal: controller.signal
-          });
-          clearTimeout(timeoutId);
-
-          if (response.ok) {
-            const resJson = await response.json();
-            if (resJson.candidates && resJson.candidates.length > 0) {
-              resultText = resJson.candidates[0].content.parts[0].text.trim();
-              break;
-            }
-          }
-          const errorText = await response.text();
-          lastError = new Error(`Gemini API Error (${response.status}) for ${model}: ${errorText}`);
-          if (logWarning) {
-            logWarning(`Gemini API Error (${response.status}) for ${model} (attempt ${attempt}/${attempts}): ${errorText}`);
-          }
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-          backoffMs *= 2;
-        } catch (err) {
-          lastError = err;
-          if (logWarning) {
-            logWarning(`Gemini model ${model} (attempt ${attempt}/${attempts}) failed: ${err.message}`);
-          }
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-          backoffMs *= 2;
+  const resolverSchema = {
+    type: "OBJECT",
+    properties: {
+      decision: { type: "STRING", enum: ["BUY", "SELL", "HOLD", "SHORT", "COVER"] },
+      reasoning: { type: "STRING" },
+      confidence: { type: "NUMBER" },
+      amount_pct: { type: "INTEGER" },
+      market_structure: { type: "STRING" },
+      support_level: { type: "NUMBER" },
+      resistance_level: { type: "NUMBER" },
+      news_sentiment_score: { type: "INTEGER" },
+      risk_reward_ratio: { type: "NUMBER" },
+      forward_plan: { type: "STRING" },
+      proposed_conditional_orders: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            action: { type: "STRING", enum: ["BUY", "SELL", "SHORT", "COVER"] },
+            amount_pct: { type: "INTEGER" },
+            trigger_type: { type: "STRING", enum: ["price_below", "price_above"] },
+            trigger_value: { type: "NUMBER" },
+            reasoning: { type: "STRING" }
+          },
+          required: ["action", "amount_pct", "trigger_type", "trigger_value", "reasoning"]
         }
       }
-      if (resultText) break;
-    }
-  }
+    },
+    required: [
+      "decision", "reasoning", "confidence", "amount_pct", 
+      "market_structure", "support_level", "resistance_level", 
+      "news_sentiment_score", "risk_reward_ratio", "forward_plan", 
+      "proposed_conditional_orders"
+    ]
+  };
 
-  if (!resultText) {
-    throw lastError || new Error(`All candidate models for provider ${provider} failed to return a valid decision response.`);
-  }
+  const auditorSchema = {
+    type: "OBJECT",
+    properties: {
+      critique_summary: { type: "STRING" },
+      dimension_x_critique: { type: "STRING" },
+      dimension_y_critique: { type: "STRING" },
+      dimension_z_critique: { type: "STRING" },
+      suggested_action_override: { type: "STRING", enum: ["HOLD", "REDUCE_SIZE", "CONFIRM_AS_IS", "REVERSE_DIRECTION"] },
+      suggested_amount_pct: { type: "INTEGER" },
+      auditor_confidence: { type: "NUMBER" }
+    },
+    required: [
+      "critique_summary", "dimension_x_critique", "dimension_y_critique", 
+      "dimension_z_critique", "suggested_action_override", 
+      "suggested_amount_pct", "auditor_confidence"
+    ]
+  };
 
-  // Extract the JSON object block (everything between first { and last })
-  const jsonMatch = resultText.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    resultText = jsonMatch[0];
-  }
+  if (logCallback) logCallback("Executing Strategist analysis cycle...", "info");
 
-  // Attempt to parse and validate the JSON output
-  const decisionObj = JSON.parse(resultText);
-  
-  // Normalize and validate
+  const strategistModel = settings.activeLlmModel || "gemini-2.5-flash";
+  let strategistRaw = await queryModelWithFallback(
+    provider,
+    strategistModel,
+    activeApiKey,
+    strategistSystemInstruction,
+    strategistPrompt,
+    resolverSchema,
+    settings,
+    logCallback
+  );
+
+  const stratJsonMatch = strategistRaw.match(/\{[\s\S]*\}/);
+  if (stratJsonMatch) strategistRaw = stratJsonMatch[0];
+  const decisionObj = JSON.parse(strategistRaw);
+
+  // Normalize strategistDecision fields
   if (!["BUY", "SELL", "HOLD", "SHORT", "COVER"].includes(decisionObj.decision)) {
     decisionObj.decision = "HOLD";
   }
@@ -462,7 +528,149 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
     ? decisionObj.proposed_conditional_orders
     : [];
 
-  return decisionObj;
+  const hasConditionalOrders = decisionObj.proposed_conditional_orders.length > 0;
+  if (!settings.dualLlmEnabled || (decisionObj.decision === "HOLD" && !hasConditionalOrders)) {
+    if (settings.dualLlmEnabled && logCallback) {
+      logCallback("Strategist resolved to HOLD with no target orders. Skipping Dual-LLM Audit.", "info");
+    }
+    return decisionObj;
+  }
+
+  // --- DUAL-LLM consensus debate engine ---
+  if (logCallback) {
+    logCallback(`[STRATEGIST] Proposed Action: ${decisionObj.decision} | Sizing: ${decisionObj.amount_pct}% | Confidence: ${(decisionObj.confidence * 100).toFixed(0)}%`, "info");
+  }
+
+  // 2. Query the Risk Auditor
+  const auditorModel = settings.auditorModel || "gemini-2.5-flash";
+  const auditorSystemInstruction = `You are Aether's Risk Auditor and Lead Critic. Your job is to act as a cynical, skeptical short seller and risk auditor. You must cross-examine the Strategist's trading proposal and highlight every possible reason why this trade could fail, including wave count invalidation, trend weakness, volume discrepancies, leverage/margin risks, and sizing errors. Think in the 3D Cognitive Space:
+- Axis X: Structural flaws, incorrect wave counts, or ignored resistance/support.
+- Axis Y: Divergences in momentum, weak volume support, or conflicting indicators.
+- Axis Z: Sizing concerns, liquidation proximity, and rule violations.
+Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`;
+
+  const auditorPrompt = `
+=== STRATEGIST PROPOSAL ===
+${JSON.stringify(decisionObj, null, 2)}
+
+=== CURRENT MARKET & PORTFOLIO STATE ===
+${marketContext}
+
+=== PERSISTENT STRATEGY RULES ===
+${customRulesInstruction}
+
+Analyze the strategist's proposal skeptically. Output a JSON object with the following fields:
+1. "critique_summary": "High-level summary of risks"
+2. "dimension_x_critique": "Critique of structural/EWT pattern"
+3. "dimension_y_critique": "Critique of indicators/momentum"
+4. "dimension_z_critique": "Critique of leverage, size, and safety"
+5. "suggested_action_override": "HOLD", "REDUCE_SIZE", "CONFIRM_AS_IS", or "REVERSE_DIRECTION"
+6. "suggested_amount_pct": integer between 0 and 100
+7. "auditor_confidence": float between 0.0 and 1.0
+
+Remember: Respond ONLY with a valid raw JSON object matching the schema. No markdown codeblocks.
+`;
+
+  if (logCallback) logCallback(`[AUDITOR] Auditing proposed trade with model ${auditorModel}...`, "info");
+
+  let auditorRaw = await queryModelWithFallback(
+    provider,
+    auditorModel,
+    activeApiKey,
+    auditorSystemInstruction,
+    auditorPrompt,
+    auditorSchema,
+    settings,
+    logCallback
+  );
+
+  const auditorJsonMatch = auditorRaw.match(/\{[\s\S]*\}/);
+  if (auditorJsonMatch) auditorRaw = auditorJsonMatch[0];
+  const auditorCritique = JSON.parse(auditorRaw);
+
+  if (logCallback) {
+    logCallback(`[AUDITOR] Override recommendation: ${auditorCritique.suggested_action_override} | Suggested Size: ${auditorCritique.suggested_amount_pct}% | Critique: "${auditorCritique.critique_summary}"`, "info");
+  }
+
+  // 3. Query the Debate Resolver
+  const resolverModel = strategistModel;
+  const resolverSystemInstruction = `You are Aether's Debate Resolver and Consensus Arbiter. Your job is to review the Strategist's trading proposal and the Risk Auditor's skeptical critique, resolve any conflicts, verify compliance with all custom trading rules, and determine the final trading action. Think in the 3D Cognitive Space:
+- Axis X: Reconcile structural patterns and Elliott Wave counts.
+- Axis Y: Reconcile indicator momentum and volume validation.
+- Axis Z: Determine final safe positioning, size allocations (must not exceed max allocation caps), and invalidation triggers.
+
+You MUST output a final verified decision. If the Auditor raised high-confidence warning signs (e.g. divergence or high leverage), you are strongly encouraged to downgrade "amount_pct" or override the decision to "HOLD".
+Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`;
+
+  const resolverPrompt = `
+=== STRATEGIST PROPOSAL ===
+${JSON.stringify(decisionObj, null, 2)}
+
+=== RISK AUDITOR CRITIQUE ===
+${JSON.stringify(auditorCritique, null, 2)}
+
+=== CURRENT MARKET & PORTFOLIO STATE ===
+${marketContext}
+
+=== PERSISTENT STRATEGY RULES ===
+${customRulesInstruction}
+
+Reconcile the debate. Output the final, resolved decision in JSON format matching the main schema:
+{
+  "decision": "BUY" | "SELL" | "HOLD" | "SHORT" | "COVER",
+  "reasoning": "A paragraph explaining the final decision. Detail the consensus reached. Explain how the Strategist's and Auditor's arguments were reconciled along the 3D axes: Axis X (Structure), Axis Y (Momentum), and Axis Z (Risk).",
+  "confidence": float,
+  "amount_pct": integer,
+  "market_structure": "string",
+  "support_level": number,
+  "resistance_level": number,
+  "news_sentiment_score": integer,
+  "risk_reward_ratio": number,
+  "forward_plan": "A conversational forward-looking strategy note",
+  "proposed_conditional_orders": [...]
+}
+
+Remember: Output ONLY valid raw JSON matching the required schema. No markdown codeblocks.
+`;
+
+  if (logCallback) logCallback("Reconciling strategist and auditor perspectives for final consensus...", "info");
+
+  let resolverRaw = await queryModelWithFallback(
+    provider,
+    resolverModel,
+    activeApiKey,
+    resolverSystemInstruction,
+    resolverPrompt,
+    resolverSchema,
+    settings,
+    logCallback
+  );
+
+  const resolverJsonMatch = resolverRaw.match(/\{[\s\S]*\}/);
+  if (resolverJsonMatch) resolverRaw = resolverJsonMatch[0];
+  const finalDecision = JSON.parse(resolverRaw);
+
+  // Normalize final decision fields
+  if (!["BUY", "SELL", "HOLD", "SHORT", "COVER"].includes(finalDecision.decision)) {
+    finalDecision.decision = "HOLD";
+  }
+  finalDecision.confidence = Math.max(0, Math.min(1, Number(finalDecision.confidence) || 0));
+  finalDecision.amount_pct = Math.max(1, Math.min(100, Number(finalDecision.amount_pct) || 10));
+  finalDecision.market_structure = String(finalDecision.market_structure || "N/A");
+  finalDecision.support_level = Number(finalDecision.support_level) || 0;
+  finalDecision.resistance_level = Number(finalDecision.resistance_level) || 0;
+  finalDecision.news_sentiment_score = Math.max(-10, Math.min(10, Number(finalDecision.news_sentiment_score) || 0));
+  finalDecision.risk_reward_ratio = Number(finalDecision.risk_reward_ratio) || 0;
+  finalDecision.forward_plan = String(finalDecision.forward_plan || "");
+  finalDecision.proposed_conditional_orders = Array.isArray(finalDecision.proposed_conditional_orders)
+    ? finalDecision.proposed_conditional_orders
+    : [];
+
+  if (logCallback) {
+    logCallback(`[CONSENSUS] Final Decision: ${finalDecision.decision} | Sizing: ${finalDecision.amount_pct}% | Reasoning: "${finalDecision.reasoning}"`, "info");
+  }
+
+  return finalDecision;
 }
 
 /**
