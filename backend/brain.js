@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { writeStateNode, writeDebateLog } = require('./obsidianWriter');
 
 /**
  * Ask Gemini for a trading decision
@@ -329,6 +330,31 @@ ${marketData.performanceJournal || "No recent trade history available."}
 ${candleSummary}
 `;
 
+  // Append BTC Macro and Order Book Imbalance Context if available
+  let btcAndOrderBookContext = "";
+  if (marketData.btcContext || marketData.orderBook) {
+    btcAndOrderBookContext += "\n=== CROSS-ASSET CORRELATION & LIQUIDITY DEPTH ===\n";
+    
+    if (marketData.btcContext) {
+      const btc = marketData.btcContext;
+      btcAndOrderBookContext += `--- Bitcoin (BTC) Macro Trend ---\n`;
+      btcAndOrderBookContext += `- BTC Price: ${btc.price !== null && btc.price !== undefined ? `$${btc.price}` : "N/A"}\n`;
+      btcAndOrderBookContext += `- BTC Daily RSI: ${btc.rsi !== null && btc.rsi !== undefined ? btc.rsi : "N/A"}\n`;
+      btcAndOrderBookContext += `- BTC Daily SMA Cross: ${btc.smaCross || "N/A"}\n`;
+      btcAndOrderBookContext += `- BTC Trend Status: ${btc.trend || "N/A"}\n`;
+    }
+    
+    if (marketData.orderBook) {
+      const ob = marketData.orderBook;
+      btcAndOrderBookContext += `--- Order Book Liquidity Imbalance (${settings.selectedAsset}) ---\n`;
+      btcAndOrderBookContext += `- Bid/Ask Volume Ratio (Obi): ${ob.imbalanceRatio !== null && ob.imbalanceRatio !== undefined ? ob.imbalanceRatio : "N/A"}\n`;
+      btcAndOrderBookContext += `- Whale Wall Status: ${ob.wallStatus || "N/A"}\n`;
+      btcAndOrderBookContext += `  *(Obi > 1.5 indicates heavy buying support / BUY_WALL_SUPPORT; Obi < 0.6 indicates heavy selling resistance / SELL_WALL_RESISTANCE)*\n`;
+    }
+    btcAndOrderBookContext += "\n";
+  }
+  marketContext += btcAndOrderBookContext;
+
   let sentimentContext = "";
   if (settings.newsSentimentEnabled && marketData.news && marketData.news.length > 0) {
     const newsSummary = marketData.news.map((item, idx) => 
@@ -391,6 +417,52 @@ You are executing a TOP-DOWN trading strategy.
     console.error("Failed to load custom trading rules for prompt context:", err.message);
   }
 
+  // Load dynamic strategy rules from Obsidian Vault
+  let obsidianStrategyRules = "";
+  if (settings.obsidianVaultPath) {
+    const activeObsidianStrat = readActiveObsidianStrategy(settings.obsidianVaultPath);
+    if (activeObsidianStrat) {
+      obsidianStrategyRules = `\n=== DYNAMIC OBSIDIAN STRATEGY RULES (ERA ACTIVE) ===\n${activeObsidianStrat}\n`;
+    }
+  }
+
+  // Load historical memory query from Obsidian Vault (RAG)
+  let obsidianMemoryContext = "";
+  if (settings.obsidianVaultPath) {
+    obsidianMemoryContext = queryHistoricalStates(settings.obsidianVaultPath, marketRegime, latestRsi);
+  }
+
+  // Load empirically verified hypotheses from Obsidian Vault
+  let obsidianHypothesesContext = "";
+  if (settings.obsidianVaultPath) {
+    const { readActiveHypotheses } = require('./hypothesisEngine');
+    obsidianHypothesesContext = readActiveHypotheses(settings.obsidianVaultPath);
+  }
+
+  // Load and evaluate sizing formula from db.json if available
+  let mathSizingRecommendation = null;
+  try {
+    const dbPath = path.join(__dirname, 'db.json');
+    if (fs.existsSync(dbPath)) {
+      const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+      if (db.settings && db.settings.activeSizingFormula) {
+        const { runFormulaInSandbox } = require('./sizingSandbox');
+        const metrics = {
+          rsi: latestRsi,
+          adx: currentADX,
+          plusDI: currentPlusDI,
+          minusDI: currentMinusDI,
+          rvol: currentRVol,
+          close: currentPrice
+        };
+        const recommendedSize = runFormulaInSandbox(db.settings.activeSizingFormula, metrics);
+        mathSizingRecommendation = Math.max(0, Math.min(100, recommendedSize));
+      }
+    }
+  } catch (err) {
+    console.error("Failed to execute active sizing formula for prompt context:", err.message);
+  }
+
   const strategistSystemInstruction = `You are a master algorithmic cryptocurrency trader specializing in Elliott Wave Theory, Fibonacci Retracements, and momentum analysis. Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`;
 
   const strategistPrompt = `
@@ -399,6 +471,9 @@ ${settings.customPrompt}
 
 ${stratInstructions}
 ${customRulesInstruction}
+${obsidianStrategyRules}
+${obsidianHypothesesContext}
+${obsidianMemoryContext}
 
 === 3D COGNITIVE THINKING SPACE ===
 You must process and structure your analysis inside a 3-Dimensional Cognitive Space, rather than standard linear thinking:
@@ -408,21 +483,20 @@ You must process and structure your analysis inside a 3-Dimensional Cognitive Sp
 
 Your output "reasoning" MUST begin with a clearly structured "[3D COGNITIVE CO-ORDINATES]" mapping detailing the coordinates of this trade on Axis X, Axis Y, and Axis Z.
 
-=== MANDATORY SYSTEM RULES ===
-1. **Chain-of-Thought Decision Checklist**:
-   You MUST evaluate the following checklist step-by-step inside your "reasoning" output:
-   - Check Macro daily trend/regime alignment.
-   - Verify the current Elliott Wave count.
-   - Check if Relative Volume (RVol) validates the move.
-   - Cross-examine the active ADX Market Regime.
-   - Reflect on your Performance Memory Journal history (avoid repeating past entry/exit errors).
-   - Calculate risk-to-reward ratio.
-   
-2. **Regime-Based Trade Sizing**:
-   You MUST scale your "amount_pct" allocation according to the active Market Regime:
-   - If marketRegime is "CHOPPY_RANGE" (ADX < 20), you are prohibited from setting amount_pct > 30%. You must make small, defensive trades.
-   - If marketRegime is "TRENDING_BULLISH" and RVol > 1.5 (confirmed Wave 3 breakout), you are encouraged to scale up amount_pct to 75%-100% to maximize compounding.
-   - In "TRENDING_BEARISH" regimes, your default action should be to HOLD (remaining in cash), SHORT (open a leveraged short position near macro resistance), or COVER (buy-back to close/take profit on a short near macro support). Avoid long buying.
+=== MANDATORY HEURISTIC GUIDELINES ===
+1. **Chain-of-Thought Decision Heuristics**:
+   You MUST evaluate the following heuristics step-by-step inside your "reasoning" output:
+   - Structural Maturity (Elliott Wave/EWT Map): Where are we in the macro structure? Is this a high-probability swing accumulation floor (like Wave 2, 4, or corrective ABC bottom)?
+   - Momentum Confirmation (Indicators Radar): Do micro indicators (RSI, MACD, SMA crossover, AO, RVol) confirm the structural turn?
+   - External Dynamics (BTC & Order Book): How hostile is the macro environment? Weigh the BTC trend and immediate sell/buy walls.
+   - Historical Precedent (Obsidian Memory): Review matching past outcomes and takeaways to avoid repeating errors.
+
+2. **Heuristic Trade Sizing (Opportunity vs. Risk Weighting)**:
+   You have the autonomy to recommend any position size 'amount_pct', but you must scale it dynamically based on your confidence across the heuristics:
+   - Clear bull market alignment (Bullish EWT + Bullish indicators + Bullish BTC + no sell walls): Scale sizing up (up to 75%-100% cap).
+   - Choppy or consolidating markets (ADX < 20): Cap sizing to <= 30%.
+   - Bearish BTC trend or Overbought BTC RSI (>75) represents systemic drag. Do not block trades completely; instead, scale size down (e.g. cut by 50% to 10%-20% size) and tighten stop-loss invalidation thresholds.
+   - Severe sell-side order book walls (Obi < 0.6 or "SELL_WALL_RESISTANCE") represent high overhead supply. Scale size down (to <=30%) unless XRP is showing clear decoupling (low correlation and very high volume breakout).
 
 ${mtfInstruction}
 
@@ -494,46 +568,75 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
     ]
   };
 
-  if (logCallback) logCallback("Executing Strategist analysis cycle...", "info");
+  let decisionObj = null;
+  let wargameResult = null;
 
-  const strategistModel = settings.activeLlmModel || "gemini-2.5-flash";
-  let strategistRaw = await queryModelWithFallback(
-    provider,
-    strategistModel,
-    activeApiKey,
-    strategistSystemInstruction,
-    strategistPrompt,
-    resolverSchema,
-    settings,
-    logCallback
-  );
+  if (settings.dualLlmEnabled) {
+    if (logCallback) logCallback("Executing Multi-Desk Wargaming simulation...", "info");
+    const { runWargamingSimulation } = require('./wargame');
+    wargameResult = await runWargamingSimulation(activeApiKey, marketData, portfolio, settings, logCallback, queryModelWithFallback);
+    
+    // Construct decisionObj from Wave Theorist to maintain compatibility with downstream logging/structure
+    decisionObj = {
+      decision: wargameResult.waveDesk.proposed_action,
+      amount_pct: Math.round(wargameResult.waveDesk.confidence * 100),
+      confidence: wargameResult.waveDesk.confidence,
+      reasoning: `[Wave Theorist Summary] ${wargameResult.waveDesk.summary} (Targets: ${wargameResult.waveDesk.target_levels})`,
+      market_structure: wargameResult.waveDesk.summary,
+      support_level: currentPrice * 0.95,
+      resistance_level: currentPrice * 1.05,
+      news_sentiment_score: 0,
+      risk_reward_ratio: 2.0,
+      forward_plan: `Wargame debate concluded. Scenarios projected: ${wargameResult.scenarios.map(s => `${s.scenario} (${s.probability_pct}%)`).join(", ")}`,
+      proposed_conditional_orders: []
+    };
+  } else {
+    // Run normal single-LLM strategist
+    if (logCallback) logCallback("Executing Strategist analysis cycle...", "info");
+    const strategistModel = settings.activeLlmModel || "gemini-2.5-flash";
+    let strategistRaw = await queryModelWithFallback(
+      provider,
+      strategistModel,
+      activeApiKey,
+      strategistSystemInstruction,
+      strategistPrompt,
+      resolverSchema,
+      settings,
+      logCallback
+    );
 
-  const stratJsonMatch = strategistRaw.match(/\{[\s\S]*\}/);
-  if (stratJsonMatch) strategistRaw = stratJsonMatch[0];
-  const decisionObj = JSON.parse(strategistRaw);
+    const stratJsonMatch = strategistRaw.match(/\{[\s\S]*\}/);
+    if (stratJsonMatch) strategistRaw = stratJsonMatch[0];
+    decisionObj = JSON.parse(strategistRaw);
 
-  // Normalize strategistDecision fields
-  if (!["BUY", "SELL", "HOLD", "SHORT", "COVER"].includes(decisionObj.decision)) {
-    decisionObj.decision = "HOLD";
-  }
-  decisionObj.confidence = Math.max(0, Math.min(1, Number(decisionObj.confidence) || 0));
-  decisionObj.amount_pct = Math.max(1, Math.min(100, Number(decisionObj.amount_pct) || 10));
-  decisionObj.market_structure = String(decisionObj.market_structure || "N/A");
-  decisionObj.support_level = Number(decisionObj.support_level) || 0;
-  decisionObj.resistance_level = Number(decisionObj.resistance_level) || 0;
-  decisionObj.news_sentiment_score = Math.max(-10, Math.min(10, Number(decisionObj.news_sentiment_score) || 0));
-  decisionObj.risk_reward_ratio = Number(decisionObj.risk_reward_ratio) || 0;
-  decisionObj.forward_plan = String(decisionObj.forward_plan || "");
-  decisionObj.proposed_conditional_orders = Array.isArray(decisionObj.proposed_conditional_orders)
-    ? decisionObj.proposed_conditional_orders
-    : [];
-
-  const hasConditionalOrders = decisionObj.proposed_conditional_orders.length > 0;
-  if (!settings.dualLlmEnabled || (decisionObj.decision === "HOLD" && !hasConditionalOrders)) {
-    if (settings.dualLlmEnabled && logCallback) {
-      logCallback("Strategist resolved to HOLD with no target orders. Skipping Dual-LLM Audit.", "info");
+    // Normalize strategistDecision fields
+    if (!["BUY", "SELL", "HOLD", "SHORT", "COVER"].includes(decisionObj.decision)) {
+      decisionObj.decision = "HOLD";
     }
-    return decisionObj;
+    decisionObj.confidence = Math.max(0, Math.min(1, Number(decisionObj.confidence) || 0));
+    decisionObj.amount_pct = Math.max(1, Math.min(100, Number(decisionObj.amount_pct) || 10));
+    decisionObj.market_structure = String(decisionObj.market_structure || "N/A");
+    decisionObj.support_level = Number(decisionObj.support_level) || 0;
+    decisionObj.resistance_level = Number(decisionObj.resistance_level) || 0;
+    decisionObj.news_sentiment_score = Math.max(-10, Math.min(10, Number(decisionObj.news_sentiment_score) || 0));
+    decisionObj.risk_reward_ratio = Number(decisionObj.risk_reward_ratio) || 0;
+    decisionObj.forward_plan = String(decisionObj.forward_plan || "");
+    decisionObj.proposed_conditional_orders = Array.isArray(decisionObj.proposed_conditional_orders)
+      ? decisionObj.proposed_conditional_orders
+      : [];
+
+    const hasConditionalOrders = decisionObj.proposed_conditional_orders.length > 0;
+    if (!settings.dualLlmEnabled && decisionObj.decision === "HOLD" && !hasConditionalOrders) {
+      if (logCallback) {
+        logCallback("Strategist resolved to HOLD with no target orders. Skipping Dual-LLM Audit.", "info");
+      }
+      try {
+        saveStateToObsidian(settings, marketData, decisionObj);
+      } catch (e) {
+        console.error("Error writing Obsidian state node:", e.message);
+      }
+      return decisionObj;
+    }
   }
 
   // --- DUAL-LLM consensus debate engine ---
@@ -543,13 +646,55 @@ Remember: Output ONLY valid raw JSON matching the required schema. Do not includ
 
   // 2. Query the Risk Auditor
   const auditorModel = settings.auditorModel || "gemini-2.5-flash";
-  const auditorSystemInstruction = `You are Aether's Risk Auditor and Lead Critic. Your job is to act as a cynical, skeptical short seller and risk auditor. You must cross-examine the Strategist's trading proposal and highlight every possible reason why this trade could fail, including wave count invalidation, trend weakness, volume discrepancies, leverage/margin risks, and sizing errors. Think in the 3D Cognitive Space:
+  const auditorSystemInstruction = wargameResult 
+    ? `You are Aether's Risk Auditor and Lead Critic. Your job is to act as a cynical, skeptical short seller and risk auditor. You must cross-examine the Wargaming Scenarios & Debate projections and highlight every possible reason why these projections could fail, including wave count invalidation, trend weakness, volume discrepancies, leverage/margin risks, and sizing errors. Think in the 3D Cognitive Space:
 - Axis X: Structural flaws, incorrect wave counts, or ignored resistance/support.
 - Axis Y: Divergences in momentum, weak volume support, or conflicting indicators.
 - Axis Z: Sizing concerns, liquidation proximity, and rule violations.
+
+You MUST evaluate and enforce the following Heuristic Sizing modifiers:
+1. BTC Macro Trend: If BTC's daily trend is BEARISH, SMA cross is Bearish, or Daily RSI is overbought (>75), object to large sizes (recommend REDUCE_SIZE to 10%-20% or HOLD) due to systemic drag.
+2. Whale Wall Resistance: If Obi < 0.6 or Wall Status is "SELL_WALL_RESISTANCE", recommend REDUCE_SIZE (capping at <=30% size) or HOLD, unless the Strategist has presented a high-volume, low-correlation XRP decoupling thesis.
+3. Historical Lessons: Review past RAG memories. If the projected structure matches a past trade failure, recommend HOLD or size reduction.
+
+Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`
+    : `You are Aether's Risk Auditor and Lead Critic. Your job is to act as a cynical, skeptical short seller and risk auditor. You must cross-examine the Strategist's trading proposal and highlight every possible reason why this trade could fail, including wave count invalidation, trend weakness, volume discrepancies, leverage/margin risks, and sizing errors. Think in the 3D Cognitive Space:
+- Axis X: Structural flaws, incorrect wave counts, or ignored resistance/support.
+- Axis Y: Divergences in momentum, weak volume support, or conflicting indicators.
+- Axis Z: Sizing concerns, liquidation proximity, and rule violations.
+
+You MUST evaluate and enforce the following Heuristic Sizing modifiers:
+1. BTC Macro Trend: If BTC's daily trend is BEARISH, SMA cross is Bearish, or Daily RSI is overbought (>75), object to large sizes (recommend REDUCE_SIZE to 10%-20% or HOLD) due to systemic drag.
+2. Whale Wall Resistance: If Obi < 0.6 or Wall Status is "SELL_WALL_RESISTANCE", recommend REDUCE_SIZE (capping at <=30% size) or HOLD, unless the Strategist has presented a high-volume, low-correlation XRP decoupling thesis.
+3. Historical Lessons: Review past RAG memories. If the Strategist proposes a trade structure that matches a past trade failure, recommend HOLD or size reduction.
+
 Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`;
 
-  const auditorPrompt = `
+  const auditorPrompt = wargameResult
+    ? `
+=== WARGAMING SCENARIOS & DEBATE ===
+${wargameResult.transcript}
+
+=== CURRENT MARKET & PORTFOLIO STATE ===
+${marketContext}
+
+=== PERSISTENT STRATEGY RULES ===
+${customRulesInstruction}
+${obsidianStrategyRules}
+${obsidianHypothesesContext}
+
+Analyze the wargaming scenarios and debate projections skeptically. Highlight risks in each scenario path. Output a JSON object with the following fields:
+1. "critique_summary": "High-level summary of risks"
+2. "dimension_x_critique": "Critique of wave/structural projections"
+3. "dimension_y_critique": "Critique of flow/momentum projections"
+4. "dimension_z_critique": "Critique of risk, sizing, and safety"
+5. "suggested_action_override": "HOLD", "REDUCE_SIZE", "CONFIRM_AS_IS", or "REVERSE_DIRECTION"
+6. "suggested_amount_pct": integer between 0 and 100
+7. "auditor_confidence": float between 0.0 and 1.0
+
+Remember: Respond ONLY with a valid raw JSON object matching the schema. No markdown codeblocks.
+`
+    : `
 === STRATEGIST PROPOSAL ===
 ${JSON.stringify(decisionObj, null, 2)}
 
@@ -558,6 +703,8 @@ ${marketContext}
 
 === PERSISTENT STRATEGY RULES ===
 ${customRulesInstruction}
+${obsidianStrategyRules}
+${obsidianHypothesesContext}
 
 Analyze the strategist's proposal skeptically. Output a JSON object with the following fields:
 1. "critique_summary": "High-level summary of risks"
@@ -592,17 +739,97 @@ Remember: Respond ONLY with a valid raw JSON object matching the schema. No mark
     logCallback(`[AUDITOR] Override recommendation: ${auditorCritique.suggested_action_override} | Suggested Size: ${auditorCritique.suggested_amount_pct}% | Critique: "${auditorCritique.critique_summary}"`, "info");
   }
 
+  const boardroomWeights = settings.boardroomWeights || {
+    wave_theorist: 1.0,
+    order_flow_scalper: 1.0,
+    macro_economist: 1.0,
+    margin_cop: 1.0,
+    on_chain_detective: 1.0,
+    cross_asset_tracker: 1.0,
+    risk_range_quant: 1.0,
+    fomo_miner: 1.0
+  };
+
+  const weightsStr = `
+=== ACTIVE BOARDROOM VOTING WEIGHTS ===
+- Wave Theorist (EWT): Weight ${boardroomWeights.wave_theorist.toFixed(2)}
+- Order Flow Scalper: Weight ${boardroomWeights.order_flow_scalper.toFixed(2)}
+- Macro Sentiment Economist: Weight ${boardroomWeights.macro_economist.toFixed(2)}
+- Margin Cop: Weight ${boardroomWeights.margin_cop.toFixed(2)}
+- On-Chain Detective: Weight ${boardroomWeights.on_chain_detective.toFixed(2)}
+- Cross-Asset Tracker: Weight ${boardroomWeights.cross_asset_tracker.toFixed(2)}
+- Volatility Quant: Weight ${boardroomWeights.risk_range_quant.toFixed(2)}
+- FOMO Miner: Weight ${boardroomWeights.fomo_miner.toFixed(2)}
+`;
+
   // 3. Query the Debate Resolver
-  const resolverModel = strategistModel;
-  const resolverSystemInstruction = `You are Aether's Debate Resolver and Consensus Arbiter. Your job is to review the Strategist's trading proposal and the Risk Auditor's skeptical critique, resolve any conflicts, verify compliance with all custom trading rules, and determine the final trading action. Think in the 3D Cognitive Space:
+  const resolverModel = settings.activeLlmModel || "gemini-2.5-pro";
+  const resolverSystemInstruction = wargameResult
+    ? `You are Aether's Debate Resolver and Consensus Arbiter. Your job is to review the Wargaming Scenarios & Debate projections and the Risk Auditor's skeptical critique, resolve any conflicts, verify compliance with all custom trading rules, and determine the final trading action. Think in the 3D Cognitive Space:
 - Axis X: Reconcile structural patterns and Elliott Wave counts.
 - Axis Y: Reconcile indicator momentum and volume validation.
 - Axis Z: Determine final safe positioning, size allocations (must not exceed max allocation caps), and invalidation triggers.
 
-You MUST output a final verified decision. If the Auditor raised high-confidence warning signs (e.g. divergence or high leverage), you are strongly encouraged to downgrade "amount_pct" or override the decision to "HOLD".
+You MUST evaluate the desks' wargaming recommendations in alignment with their active Voting Weights. Desks with higher weights represent proven predictive accuracy in the current market regime and should carry more influence in your final consensus, whereas desks with lower weights should be given less sway.
+
+You MUST enforce the following Heuristic Sizing modifiers in your final consensus:
+1. BTC Macro Trend Drag: If BTC's daily trend is BEARISH, SMA cross is Bearish, or Daily RSI is overbought (>75), scale down the final trade size (e.g. cut by 50% to a 10%-20% range) and tighten stops, rather than blocking the trade completely, unless you agree there is a clear decoupling breakout.
+2. Whale Wall Resistance: If Obi < 0.6 or Wall Status is "SELL_WALL_RESISTANCE", cap the final trade size to <=30% to mitigate liquidity friction, unless the Strategist's decoupling thesis is validated by low correlation and high volume.
+3. Historical Lesson Reconciliation: Cross-reference past outcomes and takeaways to ensure we don't repeat historical trading errors.
+
+Explain how you reconciled the opportunity vs. risk factors along Axis X (Structure), Axis Y (Momentum), and Axis Z (Risk) inside your reasoning.
+Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`
+    : `You are Aether's Debate Resolver and Consensus Arbiter. Your job is to review the Strategist's trading proposal and the Risk Auditor's skeptical critique, resolve any conflicts, verify compliance with all custom trading rules, and determine the final trading action. Think in the 3D Cognitive Space:
+- Axis X: Reconcile structural patterns and Elliott Wave counts.
+- Axis Y: Reconcile indicator momentum and volume validation.
+- Axis Z: Determine final safe positioning, size allocations (must not exceed max allocation caps), and invalidation triggers.
+
+You MUST enforce the following Heuristic Sizing modifiers in your final consensus:
+1. BTC Macro Trend Drag: If BTC's daily trend is BEARISH, SMA cross is Bearish, or Daily RSI is overbought (>75), scale down the final trade size (e.g. cut by 50% to a 10%-20% range) and tighten stops, rather than blocking the trade completely, unless you agree there is a clear decoupling breakout.
+2. Whale Wall Resistance: If Obi < 0.6 or Wall Status is "SELL_WALL_RESISTANCE", cap the final trade size to <=30% to mitigate liquidity friction, unless the Strategist's decoupling thesis is validated by low correlation and high volume.
+3. Historical Lesson Reconciliation: Cross-reference past outcomes and takeaways to ensure we don't repeat historical trading errors.
+
+Explain how you reconciled the opportunity vs. risk factors along Axis X (Structure), Axis Y (Momentum), and Axis Z (Risk) inside your reasoning.
 Respond ONLY with a valid raw JSON object matching the required schema. Do not include markdown codeblocks or extra text.`;
 
-  const resolverPrompt = `
+  const resolverPrompt = wargameResult
+    ? `
+=== WARGAMING SCENARIOS & DEBATE ===
+${wargameResult.transcript}
+
+${weightsStr}
+
+=== RISK AUDITOR CRITIQUE ===
+${JSON.stringify(auditorCritique, null, 2)}
+
+=== CURRENT MARKET & PORTFOLIO STATE ===
+${marketContext}
+
+=== PERSISTENT STRATEGY RULES ===
+${customRulesInstruction}
+${obsidianStrategyRules}
+${obsidianHypothesesContext}
+
+${mathSizingRecommendation !== null ? `=== SANDBOX OPTIMIZED SIZING RECOMMENDATION ===\nRecommended position size based on backtested sizing formula: ${mathSizingRecommendation}%\nYou must adhere to this recommendation for your final 'amount_pct' sizing decision along Axis Z unless you document a strong structural EWT breakout reason.\n` : ""}
+
+Reconcile the debate. Output the final, resolved decision in JSON format matching the main schema:
+{
+  "decision": "BUY" | "SELL" | "HOLD" | "SHORT" | "COVER",
+  "reasoning": "A paragraph explaining the final decision. Detail the consensus reached. Explain how the wargaming scenarios and the Auditor's arguments were reconciled along the 3D axes: Axis X (Structure), Axis Y (Momentum), and Axis Z (Risk).",
+  "confidence": float,
+  "amount_pct": integer,
+  "market_structure": "string",
+  "support_level": number,
+  "resistance_level": number,
+  "news_sentiment_score": integer,
+  "risk_reward_ratio": number,
+  "forward_plan": "A conversational forward-looking strategy note",
+  "proposed_conditional_orders": [...]
+}
+
+Remember: Output ONLY valid raw JSON matching the required schema. No markdown codeblocks.
+`
+    : `
 === STRATEGIST PROPOSAL ===
 ${JSON.stringify(decisionObj, null, 2)}
 
@@ -614,6 +841,10 @@ ${marketContext}
 
 === PERSISTENT STRATEGY RULES ===
 ${customRulesInstruction}
+${obsidianStrategyRules}
+${obsidianHypothesesContext}
+
+${mathSizingRecommendation !== null ? `=== SANDBOX OPTIMIZED SIZING RECOMMENDATION ===\nRecommended position size based on backtested sizing formula: ${mathSizingRecommendation}%\nYou must adhere to this recommendation for your final 'amount_pct' sizing decision along Axis Z unless you document a strong structural EWT breakout reason.\n` : ""}
 
 Reconcile the debate. Output the final, resolved decision in JSON format matching the main schema:
 {
@@ -670,7 +901,96 @@ Remember: Output ONLY valid raw JSON matching the required schema. No markdown c
     logCallback(`[CONSENSUS] Final Decision: ${finalDecision.decision} | Sizing: ${finalDecision.amount_pct}% | Reasoning: "${finalDecision.reasoning}"`, "info");
   }
 
+  let stateTimestamp = null;
+  try {
+    saveDebateToObsidianAndDiscord(settings, currentPrice, decisionObj, auditorCritique, finalDecision);
+    stateTimestamp = saveStateToObsidian(settings, marketData, finalDecision);
+  } catch (e) {
+    console.error("Error writing Obsidian logs:", e.message);
+  }
+
+  finalDecision.stateTimestamp = stateTimestamp;
+  finalDecision.wargameResult = wargameResult; // attach wargame history for reward engine
   return finalDecision;
+}
+
+/**
+ * Helper to save state node to Obsidian vault
+ */
+function saveStateToObsidian(settings, marketData, decisionObj) {
+  if (!settings.obsidianVaultPath) return;
+  const { ticker, indicators } = marketData;
+  const currentPrice = ticker ? ticker.close : 0;
+  
+  // Extract indicator values safely
+  const latestAo = indicators && indicators.ao ? indicators.ao[indicators.ao.length - 1] : null;
+  const latestRsi = indicators && indicators.rsi ? indicators.rsi[indicators.rsi.length - 1] : null;
+  const latestSma9 = indicators && indicators.sma9 ? indicators.sma9[indicators.sma9.length - 1] : null;
+  const latestSma21 = indicators && indicators.sma21 ? indicators.sma21[indicators.sma21.length - 1] : null;
+  const currentADX = indicators && indicators.currentADX !== undefined ? indicators.currentADX : (indicators && indicators.adx ? indicators.adx.adx[indicators.adx.adx.length - 1] : null);
+  const currentRVol = indicators && indicators.currentRVol !== undefined ? indicators.currentRVol : (indicators && indicators.rvol ? indicators.rvol[indicators.rvol.length - 1] : null);
+  const marketRegime = (indicators && indicators.marketRegime) || "UNKNOWN";
+  const fib = (indicators && indicators.fib) || {};
+
+  const stateData = {
+    symbol: settings.selectedAsset,
+    price: currentPrice,
+    primary_indicators: {
+      ao: latestAo,
+      wave: decisionObj.market_structure || 'N/A',
+      fib: fib.level382 || 'N/A',
+      sma9: latestSma9,
+      sma21: latestSma21
+    },
+    secondary_indicators: {
+      rsi: latestRsi,
+      macd: indicators && indicators.macd && indicators.macd.histogram ? (indicators.macd.histogram[indicators.macd.histogram.length - 1] >= 0 ? "BULLISH" : "BEARISH") : "N/A",
+      rvol: currentRVol,
+      adx: currentADX,
+      market_regime: marketRegime
+    },
+    btc_context: marketData.btcContext || { price: null, rsi: null, smaCross: "UNKNOWN", trend: "UNKNOWN" },
+    order_book: marketData.orderBook || { imbalanceRatio: null, wallStatus: "UNKNOWN" }
+  };
+
+  const timestamp = new Date().toISOString();
+  writeStateNode(settings.obsidianVaultPath, timestamp, stateData, decisionObj.reasoning);
+  return timestamp;
+}
+
+/**
+ * Helper to save debate logs to Obsidian vault and post to Discord
+ */
+function saveDebateToObsidianAndDiscord(settings, currentPrice, decisionObj, auditorCritique, finalDecision) {
+  if (settings.obsidianVaultPath) {
+    const debateData = {
+      symbol: settings.selectedAsset,
+      currentPrice: currentPrice,
+      finalDecision: finalDecision.decision,
+      transcript: [
+        { role: 'trader', text: `Proposed: ${decisionObj.decision} (Size: ${decisionObj.amount_pct}%, Confidence: ${decisionObj.confidence}) - Reasoning: ${decisionObj.reasoning}` },
+        { role: 'critic', text: `Suggested: ${auditorCritique.suggested_action_override} (Size: ${auditorCritique.suggested_amount_pct}%, Confidence: ${auditorCritique.auditor_confidence}) - Critique: ${auditorCritique.critique_summary}\n\n- Critique X (Structure): ${auditorCritique.dimension_x_critique}\n- Critique Y (Momentum): ${auditorCritique.dimension_y_critique}\n- Critique Z (Risk): ${auditorCritique.dimension_z_critique}` }
+      ]
+    };
+    writeDebateLog(settings.obsidianVaultPath, new Date().toISOString(), debateData);
+  }
+
+  if (settings.discordDebateWebhookUrl) {
+    try {
+      const { sendDiscordWebhook } = require('./notifications');
+      const debateMsg = `🧠 **AETHER DEBATE CONSENSUS RESOLUTION**\n\n` +
+        `🔴 **Trader Proposal**: **${decisionObj.decision}** (Size: ${decisionObj.amount_pct}%, Conf: ${(decisionObj.confidence * 100).toFixed(0)}%)\n` +
+        `*Reasoning*: "${decisionObj.reasoning.substring(0, 400)}${decisionObj.reasoning.length > 400 ? '...' : ''}"\n\n` +
+        `🔵 **Auditor Critique**: **${auditorCritique.suggested_action_override}** (Size: ${auditorCritique.suggested_amount_pct}%, Conf: ${(auditorCritique.auditor_confidence * 100).toFixed(0)}%)\n` +
+        `*Critique*: "${auditorCritique.critique_summary}"\n\n` +
+        `🟢 **Consensus Decision**: **${finalDecision.decision}** (Size: ${finalDecision.amount_pct}%)\n` +
+        `*Consensus Reasoning*: "${finalDecision.reasoning.substring(0, 800)}${finalDecision.reasoning.length > 800 ? '...' : ''}"`;
+      
+      sendDiscordWebhook(settings.discordDebateWebhookUrl, debateMsg).catch(e => console.error("Error sending debate webhook:", e.message));
+    } catch (err) {
+      console.error("Failed to require notifications or send debate webhook:", err.message);
+    }
+  }
 }
 
 /**
@@ -1523,8 +1843,148 @@ async function queryGeminiChat(model, apiKey, systemInstruction, messages, tools
   };
 }
 
+/**
+ * Read dynamic strategy rules from Obsidian Vault
+ */
+function readActiveObsidianStrategy(vaultPath) {
+  if (!vaultPath) return "";
+  try {
+    const filePath = path.join(vaultPath, 'Beliefs', 'Strategy-Era-Active.md');
+    if (fs.existsSync(filePath)) {
+      return fs.readFileSync(filePath, 'utf8');
+    }
+  } catch (err) {
+    console.error("Error reading Strategy-Era-Active.md:", err.message);
+  }
+  return "";
+}
+
+/**
+ * Query historical states matching current regime or indicators (local RAG)
+ */
+function queryHistoricalStates(vaultPath, currentRegime, currentRsiVal) {
+  if (!vaultPath) return "";
+  try {
+    const statesDir = path.join(vaultPath, 'States');
+    if (!fs.existsSync(statesDir)) return "";
+
+    const files = fs.readdirSync(statesDir).filter(f => f.startsWith('State_') && f.endsWith('.md'));
+    if (files.length === 0) return "";
+
+    // Sort files descending (most recent first)
+    files.sort((a, b) => b.localeCompare(a));
+
+    const matches = [];
+    const maxMatches = 3;
+
+    // Classify current RSI range
+    let currentRsiLabel = "NEUTRAL";
+    if (currentRsiVal !== null && currentRsiVal < 30) currentRsiLabel = "OVERSOLD";
+    if (currentRsiVal !== null && currentRsiVal > 70) currentRsiLabel = "OVERBOUGHT";
+
+    for (const file of files) {
+      if (matches.length >= maxMatches) break;
+
+      const filePath = path.join(statesDir, file);
+      const content = fs.readFileSync(filePath, 'utf8');
+      
+      // Fast frontmatter parsing
+      const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      if (!fmMatch) continue;
+
+      const fmText = fmMatch[1];
+      
+      const regimeRegex = /market_regime:\s*"(.*?)"/;
+      const rsiRegex = /rsi:\s*(\d+(\.\d+)?)/;
+      const outcomeRegex = /outcome:\s*"(.*?)"/;
+      const takeawayRegex = /takeaway:\s*"(.*?)"/;
+
+      const regMatch = fmText.match(regimeRegex);
+      const rsiMatch = fmText.match(rsiRegex);
+      const outMatch = fmText.match(outcomeRegex);
+      const takeMatch = fmText.match(takeawayRegex);
+
+      const stateRegime = regMatch ? regMatch[1] : null;
+      const stateRsiVal = rsiMatch ? parseFloat(rsiMatch[1]) : null;
+      const stateOutcome = outMatch ? outMatch[1] : null;
+      const stateTakeaway = takeMatch ? takeMatch[1] : null;
+
+      let stateRsiLabel = "NEUTRAL";
+      if (stateRsiVal !== null && stateRsiVal < 30) stateRsiLabel = "OVERSOLD";
+      if (stateRsiVal !== null && stateRsiVal > 70) stateRsiLabel = "OVERBOUGHT";
+
+      // If we match the regime, or we match an extreme RSI state, and it has a resolved outcome
+      if ((stateRegime === currentRegime || (currentRsiLabel !== "NEUTRAL" && stateRsiLabel === currentRsiLabel)) && stateOutcome) {
+        // Extract the narrative/reasoning (the text in the ```text block)
+        const narrativeMatch = content.match(/```text\r?\n([\s\S]*?)\r?\n```/);
+        const narrative = narrativeMatch ? narrativeMatch[1].trim() : "";
+
+        matches.push({
+          file: file,
+          regime: stateRegime,
+          rsi: stateRsiVal,
+          outcome: stateOutcome,
+          takeaway: stateTakeaway,
+          narrative: narrative
+        });
+      }
+    }
+
+    if (matches.length === 0) return "";
+
+    let summary = "\n=== HISTORICAL GRAPH BRAIN MEMORIES (RAG) ===\n";
+    summary += "Here are the outcomes of historical states matching our current market regime or indicators:\n\n";
+    matches.forEach((m, idx) => {
+      summary += `${idx + 1}. Note: [[States/${m.file.replace('.md', '')}]]\n`;
+      summary += `   - Market Regime: ${m.regime}\n`;
+      summary += `   - RSI: ${m.rsi || 'N/A'}\n`;
+      summary += `   - Historical Outcome: ${m.outcome}\n`;
+      if (m.takeaway) {
+        summary += `   - Post-Mortem Lesson: "${m.takeaway}"\n`;
+      }
+      summary += `   - Historical Brain Reasoning: "${m.narrative.substring(0, 1500)}${m.narrative.length > 1500 ? '...' : ''}"\n\n`;
+    });
+    summary += "Adhere to the lessons of these outcomes to avoid repeating past failures or to replicate past successes.\n";
+    return summary;
+  } catch (err) {
+    console.error("Error querying historical states:", err.message);
+  }
+  return "";
+}
+
+/**
+ * Generates a concise (1-sentence) cognitive lesson from a completed trade's outcome.
+ */
+async function generateTradePostMortem(apiKey, tradeData, settings) {
+  try {
+    const provider = settings.activeLlmProvider || 'gemini';
+    const model = settings.activeLlmModel || 'gemini-2.5-flash';
+    const systemInstruction = "You are Aether's Performance Auditor. Your job is to analyze a completed trade's parameters, entry reasoning, and final profit/loss outcome, and write a single, direct, 1-sentence lesson (takeaway) to improve future heuristic decisions. Avoid platitudes; be specific about wave counts, indicators, size, or macro conditions.";
+    const userPrompt = `
+Completed Trade Details:
+- Action: ${tradeData.action} (Closed Position)
+- Entry Price: $${tradeData.entryPrice}
+- Exit Price: $${tradeData.exitPrice}
+- PnL (%): ${tradeData.pnlPct}%
+- Entry/Exit Reasoning: "${tradeData.reasoning}"
+
+Write exactly 1 concise sentence (maximum 25 words) summarizing the key trading lesson from this outcome. Begin with "Lesson:". Do not use quotes or backticks around the sentence.
+`;
+
+    const result = await queryModel(provider, model, apiKey, systemInstruction, userPrompt, null, settings);
+    return result.trim().replace(/^['"`]+|['"`]+$/g, '');
+  } catch (err) {
+    console.error("Error generating trade post-mortem:", err.message);
+    return `Lesson: Manage position dynamically based on EWT invalidation thresholds (Failed to query LLM: ${err.message})`;
+  }
+}
+
 module.exports = {
   getTradingDecision,
   askBrainQuestion,
-  runAIChatCompletion
+  runAIChatCompletion,
+  generateTradePostMortem,
+  queryHistoricalStates,
+  queryModelWithFallback,
+  queryModel
 };

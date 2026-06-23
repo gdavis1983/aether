@@ -328,14 +328,11 @@ function TradingViewWidget({ symbol }) {
   useEffect(() => {
     const containerId = 'tradingview_widget_' + Math.random().toString(36).substring(2, 9);
     if (container.current) {
+      container.current.innerHTML = '';
       container.current.id = containerId;
     }
 
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/tv.js';
-    script.type = 'text/javascript';
-    script.async = true;
-    script.onload = () => {
+    const initWidget = () => {
       if (typeof TradingView !== 'undefined' && document.getElementById(containerId)) {
         new TradingView.widget({
           autosize: true,
@@ -359,10 +356,31 @@ function TradingViewWidget({ symbol }) {
         });
       }
     };
-    document.head.appendChild(script);
+
+    if (window.TradingView) {
+      initWidget();
+      return;
+    }
+
+    let script = document.querySelector('script[src="https://s3.tradingview.com/tv.js"]');
+    if (!script) {
+      script = document.createElement('script');
+      script.src = 'https://s3.tradingview.com/tv.js';
+      script.type = 'text/javascript';
+      script.async = true;
+      document.head.appendChild(script);
+    }
+
+    const handleLoad = () => {
+      initWidget();
+    };
+
+    script.addEventListener('load', handleLoad);
 
     return () => {
-      script.remove();
+      if (script) {
+        script.removeEventListener('load', handleLoad);
+      }
     };
   }, [symbol]);
 
@@ -599,9 +617,16 @@ function CustomTradingChart({ candleData, setCandleData, symbol, selectedAsset, 
       }
     };
 
+    const handleDblClick = () => {
+      if (chartRef.current) {
+        chartRef.current.timeScale().fitContent();
+      }
+    };
+
     if (container) {
       container.addEventListener('mousedown', handleMouseDown, true);
       container.addEventListener('click', handleScrollClick, true);
+      container.addEventListener('dblclick', handleDblClick);
     }
     window.addEventListener('mousemove', handleMouseMove, { capture: true, passive: false });
     window.addEventListener('mouseup', handleMouseUp, true);
@@ -611,6 +636,7 @@ function CustomTradingChart({ candleData, setCandleData, symbol, selectedAsset, 
       if (container) {
         container.removeEventListener('mousedown', handleMouseDown, true);
         container.removeEventListener('click', handleScrollClick, true);
+        container.removeEventListener('dblclick', handleDblClick);
       }
       window.removeEventListener('mousemove', handleMouseMove, true);
       window.removeEventListener('mouseup', handleMouseUp, true);
@@ -639,7 +665,14 @@ function CustomTradingChart({ candleData, setCandleData, symbol, selectedAsset, 
 
   // Sync data updates
   useEffect(() => {
-    if (!candlestickSeriesRef.current || !sma9SeriesRef.current || !sma21SeriesRef.current || !candleData || candleData.length === 0) return;
+    if (!candlestickSeriesRef.current || !sma9SeriesRef.current || !sma21SeriesRef.current || !candleData) return;
+
+    if (candleData.length === 0) {
+      candlestickSeriesRef.current.setData([]);
+      sma9SeriesRef.current.setData([]);
+      sma21SeriesRef.current.setData([]);
+      return;
+    }
 
     // Sort to be chronologically ordered and filter unique timestamps
     const prevMap = new Map();
@@ -1158,6 +1191,7 @@ export default function App() {
     smtpUser: '',
     smtpPass: '',
     discordWebhookUrl: '',
+    discordDebateWebhookUrl: '',
     multiTimeframeEnabled: false,
     macroTimeframe: '1d',
     trailingStopEnabled: true,
@@ -1433,10 +1467,18 @@ export default function App() {
     if (!status) return;
 
     let isMounted = true;
+    let isInitial = true;
+    
+    // Clear old candles when switching asset or timeframe to prevent merging different markets
+    setCandleData([]);
+
     const loadPriceData = async () => {
-      setChartLoading(true);
+      if (isInitial) {
+        setChartLoading(true);
+      }
       try {
-        const res = await fetch(`${BACKEND_URL}/api/market/candles?symbol=${status.settings.selectedAsset}&timeframe=${status.settings.selectedTimeframe}&limit=600`);
+        const limit = isInitial ? 600 : 10;
+        const res = await fetch(`${BACKEND_URL}/api/market/candles?symbol=${status.settings.selectedAsset}&timeframe=${status.settings.selectedTimeframe}&limit=${limit}`);
         const data = await res.json();
         
         if (!isMounted) return;
@@ -1448,11 +1490,14 @@ export default function App() {
             data.forEach(c => prevMap.set(c.time, c));
             return Array.from(prevMap.values()).sort((a, b) => a.time - b.time);
           });
+          isInitial = false;
         }
       } catch (err) {
         console.error("Failed to load price tick:", err);
       } finally {
-        setChartLoading(false);
+        if (isInitial) {
+          setChartLoading(false);
+        }
       }
     };
 
@@ -2848,6 +2893,7 @@ export default function App() {
                 </div>
                 <div className="term-chart-frame">
                   <CustomTradingChart
+                    key={`${status?.settings?.selectedAsset || 'BTC/USD'}-${status?.settings?.selectedTimeframe || '1h'}`}
                     candleData={candleData}
                     setCandleData={setCandleData}
                     symbol={status?.settings?.selectedAsset || 'BTC/USD'}
@@ -4129,9 +4175,25 @@ export default function App() {
                       onChange={(e) => setSettingsForm({ ...settingsForm, discordWebhookUrl: e.target.value })}
                     />
                   </div>
+
+                  <div className="form-group" style={{ marginTop: '12px' }}>
+                    <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style={{ color: '#5865F2' }}>
+                        <path d="M13.55 3.15A13.27 13.27 0 0010.24 2a9.14 9.14 0 00-.42.85 12.33 12.33 0 00-3.64 0A9.3 9.3 0 005.76 2a13.36 13.36 0 00-3.31 1.15A14.1 14.1 0 00.08 12.76a13.4 13.4 0 004.08 2.06 10.1 10.1 0 00.87-1.41 8.66 8.66 0 01-1.37-.66c.11-.08.23-.17.34-.26a9.55 9.55 0 008.16 0c.11.09.22.18.34.26a8.7 8.7 0 01-1.37.66c.25.5.54.97.87 1.41a13.36 13.36 0 004.08-2.06A14.07 14.07 0 0013.55 3.15zM5.35 10.84c-.85 0-1.55-.78-1.55-1.74s.68-1.74 1.55-1.74c.86 0 1.56.78 1.55 1.74 0 .96-.69 1.74-1.55 1.74zm5.3 0c-.85 0-1.55-.78-1.55-1.74s.68-1.74 1.55-1.74c.86 0 1.56.78 1.55 1.74 0 .96-.69 1.74-1.55 1.74z"/>
+                      </svg>
+                      Discord Debate Webhook URL <span style={{ fontSize: '0.7rem', opacity: 0.5 }}>(Dedicated channel for Trader vs Auditor loop)</span>
+                    </label>
+                    <input 
+                      type="password"
+                      placeholder={status.settings.discordDebateWebhookUrl ? '••••••••' : 'https://discord.com/api/webhooks/...'}
+                      className="form-input"
+                      value={settingsForm.discordDebateWebhookUrl}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, discordDebateWebhookUrl: e.target.value })}
+                    />
+                  </div>
                 </div>
                 
-                {(settingsForm.notificationType !== 'none' || settingsForm.discordWebhookUrl) && (
+                {(settingsForm.notificationType !== 'none' || settingsForm.discordWebhookUrl || settingsForm.discordDebateWebhookUrl) && (
                   <button 
                     type="button" 
                     className="btn btn-secondary" 

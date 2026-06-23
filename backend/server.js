@@ -130,8 +130,18 @@ const defaultSettings = {
   activeDesk: "spot",
   defaultLeverage: 5,
   obsidianVaultPath: "",
-  dualLlmEnabled: false,
-  auditorModel: "gemini-2.5-flash"
+  dualLlmEnabled: true,
+  auditorModel: "gemini-2.5-flash",
+  boardroomWeights: {
+    wave_theorist: 1.0,
+    order_flow_scalper: 1.0,
+    macro_economist: 1.0,
+    margin_cop: 1.0,
+    on_chain_detective: 1.0,
+    cross_asset_tracker: 1.0,
+    risk_range_quant: 1.0,
+    fomo_miner: 1.0
+  }
 };
 
 // Bot interval runtime state
@@ -298,40 +308,78 @@ ${analysis.forward_plan || analysis.reasoning}
   writeToObsidianVault("Daily Notes", filename, markdown);
 }
 
+/**
+ * Appends a hard code override note to the latest State note in Obsidian
+ */
+function appendOverrideToState(vaultPath, overrideMessage) {
+  if (!vaultPath) return;
+  try {
+    const statesDir = path.join(vaultPath, 'States');
+    if (!fs.existsSync(statesDir)) return;
+    const files = fs.readdirSync(statesDir).filter(f => f.startsWith('State_') && f.endsWith('.md'));
+    if (files.length === 0) return;
+    files.sort((a, b) => b.localeCompare(a));
+    const filePath = path.join(statesDir, files[0]);
+    if (fs.existsSync(filePath)) {
+      let content = fs.readFileSync(filePath, 'utf8');
+      if (!content.includes('## Hard Code Override')) {
+        content += `\n\n## Hard Code Override\n- **Safety Gate Override**: ${overrideMessage}\n`;
+        fs.writeFileSync(filePath, content, 'utf8');
+      }
+    }
+  } catch (err) {
+    console.error("Failed to append hard override to Obsidian:", err.message);
+  }
+}
+
 function logTradeToObsidian(trade, assetName) {
-  const date = new Date(trade.timestamp);
-  const dateString = date.toISOString().split('T')[0]; // YYYY-MM-DD
-  const filename = `Trade_${assetName}_${trade.action}_${date.getTime()}.md`;
-  
-  let markdown = `# ⚡ Trade Execution: ${trade.action} ${trade.symbol}
+  try {
+    const db = readDB();
+    const vaultPath = db.settings?.obsidianVaultPath;
+    if (!vaultPath) return;
 
-- **Date**: ${date.toLocaleString()}
-- **Asset**: [[${assetName}]]
-- **Execution Mode**: \`${trade.mode}\`
-- **Trading Desk**: \`${trade.tradeType || 'spot'}\`
+    const { writeTradeNode } = require('./obsidianWriter');
+    
+    // Build standardized trade data
+    const tradeData = {
+      symbol: trade.symbol || `${assetName}/USDC`,
+      entryPrice: trade.entryPrice || trade.price,
+      exitPrice: trade.price,
+      pnlPct: trade.netReturnPct || 0,
+      timestamp: trade.timestamp || new Date().toISOString(),
+      activeStates: trade.activeStates || [trade.timestamp || new Date().toISOString()],
+      reasoning: trade.reasoning || 'No reasoning stored.'
+    };
 
-## 📊 Trade Metrics
-- **Action**: ${trade.action}
-- **Price**: $${trade.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-- **Size/Contracts**: ${trade.amount.toFixed(6)}
-- **Total Value**: $${trade.total.toFixed(2)} USD
-- **Fee Charged**: $${trade.fee.toFixed(4)} USD
-- **Post-Trade Balance/Collateral**: $${trade.balanceAfter.toFixed(2)} USD
-${trade.leverage ? `- **Leverage**: ${trade.leverage}x` : ''}
+    const tradeId = trade.id || Date.now();
+    writeTradeNode(vaultPath, tradeId, tradeData);
 
-${trade.netReturnVal !== undefined ? `
-## 💵 Trade Performance (Realized Returns)
-- **Net Return**: $${trade.netReturnVal.toFixed(2)} USD
-- **Return Pct**: ${trade.netReturnPct.toFixed(2)}%
-` : ''}
-
-## 🧠 Setup Rationale & Invalidation
-${trade.reasoning}
-
----
-*Links: [[Trade History]] | [[${dateString}]] | [[${assetName} Strategy]]*
-`;
-  writeToObsidianVault("Trades", filename, markdown);
+    // If this is a SELL trade (closing a position), trigger post-mortem asynchronously
+    if (trade.action === 'SELL') {
+      const apiKey = db.settings?.geminiApiKey || process.env.GEMINI_API_KEY;
+      if (apiKey) {
+        const { generateTradePostMortem } = require('./brain');
+        generateTradePostMortem(apiKey, tradeData, db.settings)
+          .then(takeaway => {
+            const { updateStateNodeWithOutcome } = require('./obsidianWriter');
+            const outcomeLink = `[[Outcomes/Trade-${tradeData.pnlPct >= 0 ? 'Win' : 'Loss'}]]`;
+            if (tradeData.activeStates && Array.isArray(tradeData.activeStates)) {
+              tradeData.activeStates.forEach(stateTime => {
+                updateStateNodeWithOutcome(vaultPath, stateTime, outcomeLink, takeaway);
+              });
+            }
+            // Propose new hypothesis based on trade outcome
+            const { proposeNewHypothesis } = require('./hypothesisEngine');
+            proposeNewHypothesis(apiKey, { ...tradeData, takeaway }, db.settings, (msg, level) => console.log(`[HYPOTHESIS] ${msg}`));
+          })
+          .catch(err => {
+            console.error("[OBSIDIAN] Asynchronous post-mortem generation failed:", err.message);
+          });
+      }
+    }
+  } catch (err) {
+    console.error("[OBSIDIAN] Failed to write trade log using writeTradeNode:", err.message);
+  }
 }
 
 
@@ -503,9 +551,11 @@ async function syncLiveBalance(db, exchange) {
             console.warn("Could not fetch price for new synced position:", pErr.message);
           }
         }
+        const existingPos = freshDb.portfolio.positions[assetName] || {};
         freshDb.portfolio.positions[assetName] = {
           amount: holdings,
-          avgEntryPrice: oldEntry || 0
+          avgEntryPrice: oldEntry || 0,
+          activeStates: existingPos.activeStates || []
         };
       } else {
         delete freshDb.portfolio.positions[assetName];
@@ -649,9 +699,165 @@ async function getMarketContext(exchange, symbol, timeframe, limit = 200) {
 }
 
 /**
+ * Fetches the order book and calculates the imbalance ratio (Obi)
+ */
+async function fetchOrderBookImbalance(exchange, symbol) {
+  try {
+    const limit = 20;
+    const orderBook = await exchange.fetchOrderBook(symbol, limit);
+    if (!orderBook || !orderBook.bids || !orderBook.asks) {
+      throw new Error("Invalid order book data received from exchange");
+    }
+
+    const topBids = orderBook.bids.slice(0, 10);
+    const topAsks = orderBook.asks.slice(0, 10);
+
+    const sumBids = topBids.reduce((sum, bid) => sum + bid[1], 0);
+    const sumAsks = topAsks.reduce((sum, ask) => sum + ask[1], 0);
+
+    if (sumAsks === 0) {
+      return {
+        imbalanceRatio: sumBids > 0 ? 999 : 1.0,
+        wallStatus: "UNKNOWN"
+      };
+    }
+
+    const imbalanceRatio = sumBids / sumAsks;
+    let wallStatus = "NEUTRAL";
+    if (imbalanceRatio > 1.5) {
+      wallStatus = "BUY_WALL_SUPPORT";
+    } else if (imbalanceRatio < 0.6) {
+      wallStatus = "SELL_WALL_RESISTANCE";
+    }
+
+    return {
+      imbalanceRatio: parseFloat(imbalanceRatio.toFixed(4)),
+      wallStatus: wallStatus
+    };
+  } catch (err) {
+    console.error(`Error fetching order book imbalance for ${symbol}:`, err.message);
+    return {
+      imbalanceRatio: null,
+      wallStatus: "UNKNOWN",
+      error: err.message
+    };
+  }
+}
+
+/**
+ * Fetches BTC daily macro context: Price, RSI, and SMA crossover status
+ */
+async function fetchBtcMacroContext(exchange) {
+  try {
+    let btcSymbol = 'BTC/USDC';
+    try {
+      await exchange.loadMarkets();
+      if (exchange.markets) {
+        if (!exchange.markets[btcSymbol] && exchange.markets['BTC/USD']) {
+          btcSymbol = 'BTC/USD';
+        }
+      }
+    } catch (e) {
+      // Ignore loadMarkets failure and proceed with BTC/USDC
+    }
+
+    const limit = 50;
+    const candlesRaw = await exchange.fetchOHLCV(btcSymbol, '1d', undefined, limit);
+    if (!candlesRaw || candlesRaw.length === 0) {
+      throw new Error(`No daily candle data returned for ${btcSymbol}`);
+    }
+
+    const candles = candlesRaw.map(c => ({
+      time: c[0],
+      open: c[1],
+      high: c[2],
+      low: c[3],
+      close: c[4],
+      volume: c[5]
+    }));
+
+    const closePrices = candles.map(c => c.close);
+    const sma9Arr = calculateSMA(closePrices, 9);
+    const sma21Arr = calculateSMA(closePrices, 21);
+    const rsiArr = calculateRSI(closePrices, 14);
+
+    const currentPrice = closePrices[closePrices.length - 1];
+    const currentSma9 = sma9Arr[sma9Arr.length - 1];
+    const currentSma21 = sma21Arr[sma21Arr.length - 1];
+    const currentRsi = rsiArr[rsiArr.length - 1];
+
+    let smaCross = "NEUTRAL";
+    if (currentSma9 !== null && currentSma21 !== null) {
+      if (currentSma9 > currentSma21) {
+        smaCross = "BULLISH (9 > 21)";
+      } else if (currentSma9 < currentSma21) {
+        smaCross = "BEARISH (9 < 21)";
+      }
+    }
+
+    return {
+      symbol: btcSymbol,
+      price: currentPrice,
+      rsi: currentRsi !== null ? parseFloat(currentRsi.toFixed(2)) : null,
+      smaCross: smaCross,
+      trend: currentSma9 > currentSma21 ? "BULLISH" : (currentSma9 < currentSma21 ? "BEARISH" : "NEUTRAL")
+    };
+  } catch (err) {
+    console.error("Error fetching BTC macro context:", err.message);
+    try {
+      const btcSymbol = 'BTC/USD';
+      const candlesRaw = await exchange.fetchOHLCV(btcSymbol, '1d', undefined, 50);
+      const candles = candlesRaw.map(c => ({
+        time: c[0],
+        open: c[1],
+        high: c[2],
+        low: c[3],
+        close: c[4],
+        volume: c[5]
+      }));
+      const closePrices = candles.map(c => c.close);
+      const sma9Arr = calculateSMA(closePrices, 9);
+      const sma21Arr = calculateSMA(closePrices, 21);
+      const rsiArr = calculateRSI(closePrices, 14);
+
+      const currentPrice = closePrices[closePrices.length - 1];
+      const currentSma9 = sma9Arr[sma9Arr.length - 1];
+      const currentSma21 = sma21Arr[sma21Arr.length - 1];
+      const currentRsi = rsiArr[rsiArr.length - 1];
+
+      let smaCross = "NEUTRAL";
+      if (currentSma9 !== null && currentSma21 !== null) {
+        if (currentSma9 > currentSma21) {
+          smaCross = "BULLISH (9 > 21)";
+        } else if (currentSma9 < currentSma21) {
+          smaCross = "BEARISH (9 < 21)";
+        }
+      }
+
+      return {
+        symbol: btcSymbol,
+        price: currentPrice,
+        rsi: currentRsi !== null ? parseFloat(currentRsi.toFixed(2)) : null,
+        smaCross: smaCross,
+        trend: currentSma9 > currentSma21 ? "BULLISH" : (currentSma9 < currentSma21 ? "BEARISH" : "NEUTRAL")
+      };
+    } catch (fallbackErr) {
+      return {
+        symbol: "BTC/USDC",
+        price: null,
+        rsi: null,
+        smaCross: "UNKNOWN",
+        trend: "UNKNOWN",
+        error: err.message + " | " + fallbackErr.message
+      };
+    }
+  }
+}
+
+/**
  * Execute a simulated paper trade
  */
-function executePaperTrade(action, amountPct, currentPrice, assetName, db, reasoning = '') {
+function executePaperTrade(action, amountPct, currentPrice, assetName, db, reasoning = '', activeStates = null) {
   const feePct = 0.001; // 0.1% trade fee
   let tradeDetails = null;
 
@@ -725,8 +931,17 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
       fee: fee,
       balanceAfter: db.portfolio.balanceUSD,
       reasoning: reasoning,
-      mode: db.settings?.tradingMode || 'paper'
+      mode: db.settings?.tradingMode || 'paper',
+      activeStates: activeStates || [new Date().toISOString()]
     };
+    
+    // Track active states on the position object
+    if (!pos.activeStates) pos.activeStates = [];
+    if (activeStates && Array.isArray(activeStates)) {
+      activeStates.forEach(st => {
+        if (!pos.activeStates.includes(st)) pos.activeStates.push(st);
+      });
+    }
   } else if (action === 'SELL') {
     const pos = db.portfolio.positions[assetName];
     if (!pos || pos.amount <= 0.00001) {
@@ -766,7 +981,8 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
       mode: db.settings?.tradingMode || 'paper',
       netReturnVal: Number(netReturnVal.toFixed(4)),
       netReturnPct: Number(netReturnPct.toFixed(2)),
-      netReturn: `${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}% ($${netReturnVal.toFixed(2)})`
+      netReturn: `${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}% ($${netReturnVal.toFixed(2)})`,
+      activeStates: activeStates || [new Date().toISOString()]
     };
   }
 
@@ -774,6 +990,16 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
     db.trades.unshift(tradeDetails);
     writeDB(db);
     logTradeToObsidian(tradeDetails, assetName);
+
+    if (action === 'SELL') {
+      try {
+        const { evaluateBoardroomPerformance } = require('./rewardEngine');
+        evaluateBoardroomPerformance(db, tradeDetails, (msg, level) => addLog(level || 'info', `[Boardroom Calibration] ${msg}`));
+      } catch (err) {
+        console.error("Failed to run boardroom performance evaluation in executePaperTrade:", err.message);
+      }
+    }
+
     return { success: true, trade: tradeDetails };
   }
 
@@ -783,7 +1009,7 @@ function executePaperTrade(action, amountPct, currentPrice, assetName, db, reaso
 /**
  * Execute a real market trade on Coinbase Advanced
  */
-async function executeLiveTrade(exchange, action, amountPct, currentPrice, assetName, db, symbol, reasoning = '') {
+async function executeLiveTrade(exchange, action, amountPct, currentPrice, assetName, db, symbol, reasoning = '', activeStates = null) {
   addLog('info', `Attempting Live Market ${action} order on Coinbase Advanced for ${symbol}...`);
 
   try {
@@ -864,8 +1090,21 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
         fee: (order.fee && typeof order.fee.cost === 'number') ? order.fee.cost : (order.cost ? order.cost * 0.001 : costRounded * 0.001),
         balanceAfter: balance.free[quoteCurrency] - (order.cost || costRounded),
         reasoning: reasoning,
-        mode: 'live'
+        mode: 'live',
+        activeStates: activeStates || [new Date().toISOString()]
       };
+      
+      // Track active states on the position object
+      if (!db.portfolio.positions[assetName]) {
+        db.portfolio.positions[assetName] = { amount: 0, avgEntryPrice: 0, activeStates: [] };
+      }
+      const pos = db.portfolio.positions[assetName];
+      if (!pos.activeStates) pos.activeStates = [];
+      if (activeStates && Array.isArray(activeStates)) {
+        activeStates.forEach(st => {
+          if (!pos.activeStates.includes(st)) pos.activeStates.push(st);
+        });
+      }
 
     } else if (action === 'SELL') {
       const holdings = balance.total[assetName] || balance.free[assetName] || 0;
@@ -917,7 +1156,8 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
         fee: orderFee,
         balanceAfter: balance.free[quoteCurrency] + (order.cost || (sellAmountRounded * currentPrice)),
         reasoning: reasoning,
-        mode: 'live'
+        mode: 'live',
+        activeStates: activeStates || [new Date().toISOString()]
       };
 
       const pos = db.portfolio.positions[assetName];
@@ -956,9 +1196,11 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
           newAvgPrice = ((oldAmount * oldAvg) + (fillAmount * fillPrice)) / totalAmount;
         }
 
+        const existingPos = db.portfolio.positions[assetName] || {};
         db.portfolio.positions[assetName] = {
           amount: liveAssetAmount,
-          avgEntryPrice: Number(newAvgPrice.toFixed(6))
+          avgEntryPrice: Number(newAvgPrice.toFixed(6)),
+          activeStates: existingPos.activeStates || []
         };
       } else if (action === 'SELL') {
         const liveAssetAmount = updatedBalance.total[assetName] || updatedBalance.free[assetName] || 0;
@@ -968,15 +1210,27 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
             delete db.highestPriceReached[assetName];
           }
         } else {
+          const existingPos = db.portfolio.positions[assetName] || {};
           db.portfolio.positions[assetName] = {
             amount: liveAssetAmount,
-            avgEntryPrice: db.portfolio.positions[assetName]?.avgEntryPrice || orderDetails.price
+            avgEntryPrice: existingPos.avgEntryPrice || orderDetails.price,
+            activeStates: existingPos.activeStates || []
           };
         }
       }
 
       writeDB(db);
       logTradeToObsidian(orderDetails, assetName);
+
+      if (action === 'SELL') {
+        try {
+          const { evaluateBoardroomPerformance } = require('./rewardEngine');
+          evaluateBoardroomPerformance(db, orderDetails, (msg, level) => addLog(level || 'info', `[Boardroom Calibration] ${msg}`));
+        } catch (err) {
+          console.error("Failed to run boardroom performance evaluation in executeLiveTrade:", err.message);
+        }
+      }
+
       return { success: true, trade: orderDetails };
     }
   } catch (err) {
@@ -988,7 +1242,7 @@ async function executeLiveTrade(exchange, action, amountPct, currentPrice, asset
 /**
  * Execute a simulated perpetual paper trade (Phase 1)
  */
-function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetName, db, reasoning = '') {
+function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetName, db, reasoning = '', activeStates = null) {
   const feePct = 0.0006; // Typical swap trading fee (0.06%)
   let tradeDetails = null;
 
@@ -1065,11 +1319,17 @@ function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetN
         leverage,
         margin: allocatedMargin,
         liquidationPrice: Number(liquidationPrice.toFixed(6)),
-        unrealizedPnL: 0.00
+        unrealizedPnL: 0.00,
+        activeStates: activeStates || [new Date().toISOString()]
       };
     } else {
       // Scale-in existing position
       const pos = futures.positions[assetName];
+      if (activeStates && Array.isArray(activeStates)) {
+        activeStates.forEach(st => {
+          if (!pos.activeStates.includes(st)) pos.activeStates.push(st);
+        });
+      }
       const totalNotional = (pos.amount * pos.entryPrice) + finalNotional;
       pos.amount += finalSize;
       pos.margin += allocatedMargin;
@@ -1095,7 +1355,8 @@ function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetN
       reasoning: reasoning,
       mode: db.settings?.tradingMode || 'paper',
       tradeType: 'futures',
-      leverage: leverage
+      leverage: leverage,
+      activeStates: activeStates || [new Date().toISOString()]
     };
 
   } else if (action === 'SELL' || action === 'COVER') {
@@ -1150,7 +1411,8 @@ function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetN
       leverage: pos.leverage,
       netReturnVal: Number(netReturnVal.toFixed(4)),
       netReturnPct: Number(netReturnPct.toFixed(2)),
-      netReturn: `${netReturnVal >= 0 ? '+' : ''}${netReturnVal.toFixed(2)} USD (${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}%)`
+      netReturn: `${netReturnVal >= 0 ? '+' : ''}${netReturnVal.toFixed(2)} USD (${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}%)`,
+      activeStates: activeStates || [new Date().toISOString()]
     };
 
     // Update or remove position
@@ -1159,6 +1421,12 @@ function executePaperPerpTrade(action, amountPct, leverage, currentPrice, assetN
 
     if (pos.amount <= 0.0001 || amountPct >= 99.9) {
       delete futures.positions[assetName];
+    } else {
+      if (activeStates && Array.isArray(activeStates)) {
+        activeStates.forEach(st => {
+          if (!pos.activeStates.includes(st)) pos.activeStates.push(st);
+        });
+      }
     }
   }
 
@@ -1287,7 +1555,8 @@ async function syncLiveFuturesState(db, exchange, symbol, assetName, marginCurre
           leverage,
           margin,
           liquidationPrice,
-          unrealizedPnL
+          unrealizedPnL,
+          activeStates: db.portfolio.futures.positions[assetName]?.activeStates || [new Date().toISOString()]
         };
       } else {
         delete db.portfolio.futures.positions[assetName];
@@ -1311,7 +1580,7 @@ async function syncLiveFuturesState(db, exchange, symbol, assetName, marginCurre
 /**
  * Execute a real swap/futures order on exchange
  */
-async function executeLivePerpTrade(exchange, action, amountPct, leverage, currentPrice, assetName, db, symbol, reasoning = '') {
+async function executeLivePerpTrade(exchange, action, amountPct, leverage, currentPrice, assetName, db, symbol, reasoning = '', activeStates = null) {
   addLog('info', `Attempting Live Market Futures ${action} order on ${exchange.id} for ${symbol}...`);
   const feePct = 0.0006; // Typical swap trading fee (0.06%)
 
@@ -1427,8 +1696,24 @@ async function executeLivePerpTrade(exchange, action, amountPct, leverage, curre
       reasoning: reasoning,
       mode: 'live',
       tradeType: 'futures',
-      leverage: leverage
+      leverage: leverage,
+      activeStates: activeStates || [new Date().toISOString()]
     };
+    
+    // Track active states on the position object
+    if (action === 'BUY' || action === 'SHORT') {
+      if (!db.portfolio.futures) db.portfolio.futures = {};
+      if (!db.portfolio.futures.positions) db.portfolio.futures.positions = {};
+      const pos = db.portfolio.futures.positions[assetName];
+      if (pos) {
+        if (!pos.activeStates) pos.activeStates = [];
+        if (activeStates && Array.isArray(activeStates)) {
+          activeStates.forEach(st => {
+            if (!pos.activeStates.includes(st)) pos.activeStates.push(st);
+          });
+        }
+      }
+    }
 
     if (action === 'SELL' || action === 'COVER') {
       const dbPos = db.portfolio.futures?.positions?.[assetName];
@@ -1518,6 +1803,72 @@ async function runBotCycle() {
   syncRulesFromObsidian();
   let db = readDB();
   const settings = db.settings;
+  const apiKey = settings.geminiApiKey || process.env.GEMINI_API_KEY;
+
+  // Weekly Meta-Cognitive Review Job Check
+  if (settings.obsidianVaultPath) {
+    const weeklyReviewMs = 7 * 24 * 60 * 60 * 1000;
+    if (!db.lastWeeklyReviewTime || (Date.now() - db.lastWeeklyReviewTime > weeklyReviewMs)) {
+      addLog('info', "Triggering Weekly Meta-Cognitive Performance Audit...");
+      try {
+        const { runWeeklyReview } = require('./jobs/reviewer');
+        runWeeklyReview(settings).then(proposedPath => {
+          if (proposedPath) {
+            let currentDb = readDB();
+            currentDb.lastWeeklyReviewTime = Date.now();
+            writeDB(currentDb);
+            addLog('info', `Weekly review completed. Proposed strategy era saved to ${proposedPath}`);
+          }
+        }).catch(err => {
+          console.error("Weekly review execution failed:", err.message);
+        });
+      } catch (err) {
+        console.error("Failed to load reviewer job:", err.message);
+      }
+    }
+  }
+
+  // Daily Hypothesis Tester Check
+  if (settings.obsidianVaultPath) {
+    const dailyTesterMs = 24 * 60 * 60 * 1000;
+    if (!db.lastHypothesisTestTime || (Date.now() - db.lastHypothesisTestTime > dailyTesterMs)) {
+      addLog('info', "Triggering Daily Hypothesis Testing Evaluation...");
+      try {
+        const { runHypothesisTester } = require('./jobs/hypothesisTester');
+        runHypothesisTester(settings, (msg, level) => addLog(level || 'info', msg)).then(() => {
+          let currentDb = readDB();
+          currentDb.lastHypothesisTestTime = Date.now();
+          writeDB(currentDb);
+          addLog('info', "Daily hypothesis testing evaluation complete.");
+        }).catch(err => {
+          console.error("Hypothesis testing evaluation failed:", err.message);
+        });
+      } catch (err) {
+        console.error("Failed to load hypothesis tester job:", err.message);
+      }
+    }
+  }
+
+  // Weekly Genetic Sizing Optimization Check
+  if (settings.obsidianVaultPath) {
+    const weeklySizingMs = 7 * 24 * 60 * 60 * 1000;
+    if (!db.lastWeeklySizingTime || (Date.now() - db.lastWeeklySizingTime > weeklySizingMs)) {
+      addLog('info', "Triggering Weekly Genetic Sizing Formula Optimization...");
+      try {
+        const { mutateAndBacktestSizing } = require('./sizingSandbox');
+        mutateAndBacktestSizing(apiKey, settings, (msg, level) => addLog(level || 'info', msg)).then(() => {
+          let currentDb = readDB();
+          currentDb.lastWeeklySizingTime = Date.now();
+          writeDB(currentDb);
+          addLog('info', "Weekly genetic sizing optimization complete.");
+        }).catch(err => {
+          console.error("Weekly sizing optimization failed:", err.message);
+        });
+      } catch (err) {
+        console.error("Failed to load sizing sandbox job:", err.message);
+      }
+    }
+  }
 
   if (!db.lastTelegramMessageTime) {
     db.lastTelegramMessageTime = Date.now();
@@ -1530,7 +1881,6 @@ async function runBotCycle() {
     return;
   }
 
-  const apiKey = settings.geminiApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     addLog('error', "Bot cycle failed: Missing Gemini API Key. Please configure it in settings.");
     // Auto disable bot to prevent spam
@@ -1550,6 +1900,25 @@ async function runBotCycle() {
     
     let marketData = await getMarketContext(exchange, settings.selectedAsset, settings.selectedTimeframe, 200);
     const currentPrice = marketData.ticker.close;
+
+    // Fetch Order Book imbalance and BTC Macro trend
+    addLog('info', `Fetching order book depth for ${settings.selectedAsset}...`);
+    let orderBook = { imbalanceRatio: null, wallStatus: "UNKNOWN" };
+    try {
+      orderBook = await fetchOrderBookImbalance(exchange, settings.selectedAsset);
+    } catch (obErr) {
+      addLog('warning', `Failed to fetch order book depth: ${obErr.message}`);
+    }
+    marketData.orderBook = orderBook;
+
+    addLog('info', "Fetching BTC daily macro trend correlation...");
+    let btcContext = { price: null, rsi: null, smaCross: "UNKNOWN", trend: "UNKNOWN" };
+    try {
+      btcContext = await fetchBtcMacroContext(exchange);
+    } catch (btcErr) {
+      addLog('warning', `Failed to fetch BTC macro trend: ${btcErr.message}`);
+    }
+    marketData.btcContext = btcContext;
 
     // Calculate Market Regime Indicators
     const latestADXArr = marketData.indicators.adx.adx;
@@ -1856,6 +2225,20 @@ async function runBotCycle() {
     
     // Save latest AI diagnostic data to database
     const freshDb = readDB();
+    
+    if (analysis.wargameResult && analysis.stateTimestamp) {
+      if (!freshDb.wargameHistory) freshDb.wargameHistory = {};
+      freshDb.wargameHistory[analysis.stateTimestamp] = analysis.wargameResult;
+      
+      const wargameKeys = Object.keys(freshDb.wargameHistory).sort();
+      if (wargameKeys.length > 200) {
+        for (let i = 0; i < wargameKeys.length - 200; i++) {
+          delete freshDb.wargameHistory[wargameKeys[i]];
+        }
+      }
+    }
+    delete analysis.wargameResult;
+
     freshDb.latestDecision = {
       ...analysis,
       timestamp: new Date().toISOString(),
@@ -1919,11 +2302,11 @@ async function runBotCycle() {
         continue;
       }
 
-      // Check if there is an existing autonomous order that matches this proposal (within 0.5% tolerance)
+      // Check if there is an existing autonomous order that matches this proposal (within 3.0% tolerance)
       const matchIdx = obsoleteAutos.findIndex(o => 
         o.action === action &&
         o.triggerType === triggerType &&
-        Math.abs(o.triggerValue - triggerValue) / triggerValue < 0.005
+        Math.abs(o.triggerValue - triggerValue) / triggerValue < 0.03
       );
 
       if (matchIdx !== -1) {
@@ -2006,6 +2389,38 @@ async function runBotCycle() {
       logCheckInToObsidian(analysis, marketRegime, currentPrice, assetName, db);
     }
 
+    // --- POSITION ACTIVE STATES TRACKING ---
+    const activeAsset = settings.selectedAsset.split('/')[0];
+    const isFuturesDesk = (settings.activeDesk === 'futures') || ['SHORT', 'COVER'].includes(analysis.decision);
+    const stateTimestamp = analysis.stateTimestamp;
+
+    if (stateTimestamp) {
+      const freshDbForStates = readDB();
+      let posModified = false;
+      if (isFuturesDesk) {
+        if (freshDbForStates.portfolio.futures?.positions?.[activeAsset]) {
+          const futuresPos = freshDbForStates.portfolio.futures.positions[activeAsset];
+          if (!futuresPos.activeStates) futuresPos.activeStates = [];
+          if (!futuresPos.activeStates.includes(stateTimestamp)) {
+            futuresPos.activeStates.push(stateTimestamp);
+            posModified = true;
+          }
+        }
+      } else {
+        if (freshDbForStates.portfolio.positions?.[activeAsset]) {
+          const spotPos = freshDbForStates.portfolio.positions[activeAsset];
+          if (!spotPos.activeStates) spotPos.activeStates = [];
+          if (!spotPos.activeStates.includes(stateTimestamp)) {
+            spotPos.activeStates.push(stateTimestamp);
+            posModified = true;
+          }
+        }
+      }
+      if (posModified) {
+        writeDB(freshDbForStates);
+      }
+    }
+
     if (analysis.decision === 'HOLD') {
       addLog('info', "Bot decision is HOLD. No orders placed.");
       return;
@@ -2017,43 +2432,57 @@ async function runBotCycle() {
     if (isFutures) {
       if (settings.tradingMode === 'paper') {
         const finalDb = readDB();
-        const result = executePaperPerpTrade(analysis.decision, analysis.amount_pct, leverageVal, currentPrice, assetName, finalDb, analysis.reasoning);
+        const activeStates = finalDb.portfolio.futures?.positions?.[assetName]?.activeStates || (stateTimestamp ? [stateTimestamp] : null);
+        const result = executePaperPerpTrade(analysis.decision, analysis.amount_pct, leverageVal, currentPrice, assetName, finalDb, analysis.reasoning, activeStates);
         if (result.success) {
           addLog('trade', `Paper Futures Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} contracts of ${assetName} at $${currentPrice} with ${leverageVal}x leverage.`);
         } else {
           addLog('info', `Paper Futures Trade failed: ${result.message}`);
+          appendOverrideToState(settings.obsidianVaultPath, `Paper Futures Trade Blocked: ${result.message}`);
         }
       } else {
         try {
           const finalDb = readDB();
-          const result = await executeLivePerpTrade(exchange, analysis.decision, analysis.amount_pct, leverageVal, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning);
+          const activeStates = finalDb.portfolio.futures?.positions?.[assetName]?.activeStates || (stateTimestamp ? [stateTimestamp] : null);
+          const result = await executeLivePerpTrade(exchange, analysis.decision, analysis.amount_pct, leverageVal, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning, activeStates);
           if (result.success) {
             addLog('trade', `Live Futures Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} contracts of ${assetName} at $${result.trade.price} with ${leverageVal}x leverage.`);
+          } else {
+            addLog('warning', `Live Futures Trade Blocked/Failed: ${result.message}`);
+            appendOverrideToState(settings.obsidianVaultPath, `Live Futures Trade Blocked: ${result.message}`);
           }
         } catch (liveErr) {
           addLog('error', `Live Bot Futures Order Trigger Failed: ${liveErr.message}`);
+          appendOverrideToState(settings.obsidianVaultPath, `Live Futures Order Exception: ${liveErr.message}`);
         }
       }
     } else {
       if (settings.tradingMode === 'paper') {
         // Execute simulated trade
         const finalDb = readDB();
-        const result = executePaperTrade(analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, analysis.reasoning);
+        const activeStates = finalDb.portfolio.positions?.[assetName]?.activeStates || (stateTimestamp ? [stateTimestamp] : null);
+        const result = executePaperTrade(analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, analysis.reasoning, activeStates);
         if (result.success) {
           addLog('trade', `Paper Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${currentPrice}`);
         } else {
           addLog('info', `Paper Trade failed: ${result.message}`);
+          appendOverrideToState(settings.obsidianVaultPath, `Paper Trade Blocked: ${result.message}`);
         }
       } else {
         // Real Live Trading Mode
         try {
           const finalDb = readDB();
-          const result = await executeLiveTrade(exchange, analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning);
+          const activeStates = finalDb.portfolio.positions?.[assetName]?.activeStates || (stateTimestamp ? [stateTimestamp] : null);
+          const result = await executeLiveTrade(exchange, analysis.decision, analysis.amount_pct, currentPrice, assetName, finalDb, settings.selectedAsset, analysis.reasoning, activeStates);
           if (result.success) {
             addLog('trade', `Live Trade executed: ${analysis.decision} ${result.trade.amount.toFixed(6)} ${assetName} at $${result.trade.price}`);
+          } else {
+            addLog('warning', `Live Trade Blocked/Failed: ${result.message}`);
+            appendOverrideToState(settings.obsidianVaultPath, `Live Trade Blocked: ${result.message}`);
           }
         } catch (liveErr) {
           addLog('error', `Live Bot Order Trigger Failed: ${liveErr.message}`);
+          appendOverrideToState(settings.obsidianVaultPath, `Live Order Exception: ${liveErr.message}`);
         }
       }
     }
@@ -2136,30 +2565,33 @@ app.get('/api/status', async (req, res) => {
     const now = Date.now();
     const exchange = getExchangeInstance(db.settings);
     
-    // Sync balance: Throttle every 30s
+    // Sync balance: Throttle every 30s (non-blocking background promise)
     if (now - lastBalanceSyncTime > 30000) {
-      db = await syncLiveBalance(db, exchange);
-      if (db.settings.activeDesk === 'futures') {
-        try {
-          const quoteCurrency = db.settings.selectedAsset.split('/')[1]?.split(':')[0] || 'USDC';
-          const assetName = db.settings.selectedAsset.split('/')[0];
-          await syncLiveFuturesState(db, exchange, db.settings.selectedAsset, assetName, quoteCurrency);
-        } catch (futSyncErr) {
-          console.error("Failed to sync live futures state for status:", futSyncErr.message);
-        }
-      }
       lastBalanceSyncTime = now;
+      syncLiveBalance(db, exchange).then(async (updatedDb) => {
+        if (updatedDb.settings.activeDesk === 'futures') {
+          try {
+            const quoteCurrency = updatedDb.settings.selectedAsset.split('/')[1]?.split(':')[0] || 'USDC';
+            const assetName = updatedDb.settings.selectedAsset.split('/')[0];
+            await syncLiveFuturesState(updatedDb, exchange, updatedDb.settings.selectedAsset, assetName, quoteCurrency);
+          } catch (futSyncErr) {
+            console.error("Failed to sync live futures state for status:", futSyncErr.message);
+          }
+        }
+      }).catch(err => {
+        console.error("Background balance sync failed:", err.message);
+      });
     }
     
-    // Fetch open orders: Throttle every 15s
+    // Fetch open orders: Throttle every 15s (non-blocking background promise)
     if (now - lastOrdersSyncTime > 15000) {
-      try {
-        const symbol = db.settings.selectedAsset;
-        cachedOpenOrders = await exchange.fetchOpenOrders(symbol);
-        lastOrdersSyncTime = now;
-      } catch (err) {
+      lastOrdersSyncTime = now;
+      const symbol = db.settings.selectedAsset;
+      exchange.fetchOpenOrders(symbol).then(orders => {
+        cachedOpenOrders = orders;
+      }).catch(err => {
         console.error("Failed to fetch Coinbase open orders for status:", err.message);
-      }
+      });
     }
     openOrders = cachedOpenOrders;
   }
@@ -2186,7 +2618,9 @@ app.get('/api/status', async (req, res) => {
       exchangeApiKey: finalDb.settings.exchangeApiKey ? '••••••••' : '',
       exchangeApiSecret: finalDb.settings.exchangeApiSecret ? '••••••••' : '',
       telegramBotToken: finalDb.settings.telegramBotToken ? '••••••••' : '',
-      smtpPass: finalDb.settings.smtpPass ? '••••••••' : ''
+      smtpPass: finalDb.settings.smtpPass ? '••••••••' : '',
+      discordWebhookUrl: finalDb.settings.discordWebhookUrl ? '••••••••' : '',
+      discordDebateWebhookUrl: finalDb.settings.discordDebateWebhookUrl ? '••••••••' : ''
     }
   });
 });
@@ -2207,6 +2641,7 @@ app.post('/api/settings', (req, res) => {
   if (updatedSettings.telegramBotToken === '••••••••') updatedSettings.telegramBotToken = oldSettings.telegramBotToken;
   if (updatedSettings.smtpPass === '••••••••') updatedSettings.smtpPass = oldSettings.smtpPass;
   if (updatedSettings.discordWebhookUrl === '••••••••') updatedSettings.discordWebhookUrl = oldSettings.discordWebhookUrl;
+  if (updatedSettings.discordDebateWebhookUrl === '••••••••') updatedSettings.discordDebateWebhookUrl = oldSettings.discordDebateWebhookUrl;
 
   db.settings = { ...db.settings, ...updatedSettings };
   writeDB(db);
@@ -2564,6 +2999,7 @@ app.post('/api/test-alert', async (req, res) => {
     if (incoming.telegramBotToken === '••••••••') incoming.telegramBotToken = oldSettings.telegramBotToken;
     if (incoming.smtpPass === '••••••••') incoming.smtpPass = oldSettings.smtpPass;
     if (incoming.discordWebhookUrl === '••••••••') incoming.discordWebhookUrl = oldSettings.discordWebhookUrl;
+    if (incoming.discordDebateWebhookUrl === '••••••••') incoming.discordDebateWebhookUrl = oldSettings.discordDebateWebhookUrl;
     settings = { ...oldSettings, ...incoming };
   }
 
@@ -2591,7 +3027,13 @@ app.post('/api/test-alert', async (req, res) => {
     // Also test Discord webhook if configured
     if (settings.discordWebhookUrl) {
       await sendDiscordWebhook(settings.discordWebhookUrl, msg);
-      results.push('Discord');
+      results.push('Discord Main Alert');
+    }
+
+    // Also test Discord Debate webhook if configured
+    if (settings.discordDebateWebhookUrl) {
+      await sendDiscordWebhook(settings.discordDebateWebhookUrl, `🧠 <b>AETHER DEBATE CHANNEL TEST</b>\n\nDebate channel integration: SUCCESSFUL!\nTimestamp: <b>${new Date().toLocaleTimeString()}</b>`);
+      results.push('Discord Debate Feed');
     }
 
     if (results.length === 0) {
@@ -3627,6 +4069,22 @@ async function handleTelegramCommand(text, token, chatId) {
     }
   }
   
+  else if (cmd === '/approve_tool' || cmd === '/approve') {
+    if (!arg) {
+      await sendResp(`❌ <b>Error:</b> Please specify the tool file name to approve (e.g. /approve_tool coinbasePremium.js)`);
+    } else {
+      const { approveTool } = require('./selfAssembly');
+      try {
+        const res = await approveTool(arg, db, sendResp);
+        if (res.success) {
+          addLog('info', `[SELF-ASSEMBLY] Tool ${arg} successfully approved and registered.`);
+        }
+      } catch (err) {
+        await sendResp(`❌ <b>Failed to approve tool:</b> ${err.message}`);
+      }
+    }
+  }
+  
   else if (cmd === '/buy') {
     let pct = 50;
     let usdAmount = null;
@@ -4033,13 +4491,18 @@ async function pollConditionalOrders() {
               
               const totalAmount = oldAmount + fillAmount;
               let newAvgPrice = fillPrice;
-              if (totalAmount > 0) {
-                newAvgPrice = ((oldAmount * oldAvg) + (fillAmount * fillPrice)) / totalAmount;
+              if (order.action === 'BUY') {
+                if (totalAmount > 0) {
+                  newAvgPrice = ((oldAmount * oldAvg) + (fillAmount * fillPrice)) / totalAmount;
+                }
+              } else {
+                newAvgPrice = oldAvg;
               }
               
               finalDb.portfolio.positions[assetName] = {
                 amount: liveAssetAmount,
-                avgEntryPrice: Number(newAvgPrice.toFixed(6))
+                avgEntryPrice: Number(newAvgPrice.toFixed(6)),
+                activeStates: oldPos.activeStates || []
               };
             }
             
@@ -4240,6 +4703,7 @@ function startConditionalOrderPoller() {
 
 // Start bot interval loop if enabled on startup
 const dbOnStart = readDB();
+writeDB(dbOnStart); // serialize defaults on start
 if (dbOnStart.settings && dbOnStart.settings.botEnabled) {
   startBotLoop(dbOnStart.settings.botIntervalMin);
 }
