@@ -17,8 +17,8 @@ function log(msg) {
   }
 }
 
-// Disable auto-download of updates so the user is prompted first
-autoUpdater.autoDownload = false;
+// Enable auto-download of updates so they are downloaded in the background
+autoUpdater.autoDownload = true;
 
 function startBackendServer() {
   const serverPath = path.join(__dirname, 'backend', 'server.js');

@@ -27,6 +27,7 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers } from 'lightweight-charts';
+import packageJson from '../../package.json';
 
 const renderLogMessage = (message) => {
   if (typeof message !== 'string') return <span>{String(message)}</span>;
@@ -1160,6 +1161,11 @@ export default function App() {
   // Custom Plugins & Strategies State
   const [customTools, setCustomTools] = useState([]);
   const [strategies, setStrategies] = useState([]);
+
+  // Auto-Updater State
+  const [updateStatus, setUpdateStatus] = useState(null); // 'available', 'downloading', 'downloaded', 'error'
+  const [updateVersion, setUpdateVersion] = useState('');
+  const [downloadProgress, setDownloadProgress] = useState(0);
   
   // Settings Form State
   const [settingsForm, setSettingsForm] = useState({
@@ -1365,6 +1371,34 @@ export default function App() {
       console.error("Error fetching bot data:", err);
     }
   };
+
+  // Listen for auto-updater events from Electron main process
+  useEffect(() => {
+    if (window.electronAPI) {
+      window.electronAPI.onUpdateAvailable((info) => {
+        setUpdateStatus('available');
+        setUpdateVersion(info.version || '');
+      });
+
+      window.electronAPI.onUpdateDownloaded(() => {
+        setUpdateStatus('downloaded');
+      });
+
+      window.electronAPI.onUpdaterLog((data) => {
+        const msg = data.message || '';
+        if (msg.includes('Downloading update') || msg.includes('Downloaded')) {
+          setUpdateStatus('downloading');
+          // Parse progress from the log string, e.g. "Downloaded 45.2%"
+          const match = msg.match(/Downloaded (\d+(\.\d+)?)\%/);
+          if (match) {
+            setDownloadProgress(parseFloat(match[1]));
+          }
+        } else if (msg.includes('Error')) {
+          setUpdateStatus('error');
+        }
+      });
+    }
+  }, []);
 
   // Poll data periodically
   useEffect(() => {
@@ -2073,58 +2107,177 @@ export default function App() {
         {/* Status indicator / Footer */}
         <div className="side-nav-footer">
           {isNavExpanded ? (
-            <div className="side-nav-bot-ops" style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '6px',
-              padding: '8px 10px',
-              background: 'rgba(255, 255, 255, 0.02)',
-              border: '1px solid rgba(255, 255, 255, 0.05)',
-              borderRadius: '6px',
-              width: '100%'
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.7rem', fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--color-secondary)', letterSpacing: '0.5px' }}>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  Bot Operations
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '100%' }}>
+              <div className="side-nav-bot-ops" style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                padding: '8px 10px',
+                background: 'rgba(255, 255, 255, 0.02)',
+                border: '1px solid rgba(255, 255, 255, 0.05)',
+                borderRadius: '6px',
+                width: '100%'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.7rem', fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--color-secondary)', letterSpacing: '0.5px' }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    Bot Operations
+                    <span style={{
+                      width: '6px',
+                      height: '6px',
+                      borderRadius: '50%',
+                      backgroundColor: status?.isBotRunning ? 'var(--color-success)' : 'var(--color-danger)',
+                      boxShadow: status?.isBotRunning ? '0 0 6px var(--color-success)' : '0 0 6px var(--color-danger)',
+                      display: 'inline-block'
+                    }} />
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: '6px', width: '100%' }}>
+                  {status?.isBotRunning ? (
+                    <button 
+                      className="btn btn-danger" 
+                      style={{ flex: 1, padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }} 
+                      onClick={() => handleToggleBot(false)} 
+                      type="button"
+                    >
+                      <Pause size={11} /> Pause Bot
+                    </button>
+                  ) : (
+                    <button 
+                      className="btn btn-success" 
+                      style={{ flex: 1, padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }} 
+                      onClick={() => handleToggleBot(true)} 
+                      type="button"
+                    >
+                      <Play size={11} /> Start Bot
+                    </button>
+                  )}
+                  <button 
+                    className="btn btn-secondary" 
+                    style={{ padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} 
+                    onClick={handleResetPortfolio} 
+                    type="button"
+                  >
+                    Reset
+                  </button>
+                </div>
+              </div>
+              <div style={{
+                fontSize: '0.65rem',
+                color: 'var(--color-text-muted)',
+                opacity: 0.6,
+                textAlign: 'left',
+                paddingLeft: '4px',
+                fontFamily: 'var(--font-mono, monospace)',
+                letterSpacing: '0.5px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                width: '100%'
+              }}>
+                <span>v{packageJson.version}</span>
+                {updateStatus === 'downloaded' && (
                   <span style={{
                     width: '6px',
                     height: '6px',
                     borderRadius: '50%',
-                    backgroundColor: status?.isBotRunning ? 'var(--color-success)' : 'var(--color-danger)',
-                    boxShadow: status?.isBotRunning ? '0 0 6px var(--color-success)' : '0 0 6px var(--color-danger)',
+                    backgroundColor: 'var(--color-success)',
+                    boxShadow: '0 0 6px var(--color-success)',
                     display: 'inline-block'
-                  }} />
-                </span>
+                  }} title="Update ready" />
+                )}
+                {updateStatus === 'available' && (
+                  <span style={{
+                    width: '6px',
+                    height: '6px',
+                    borderRadius: '50%',
+                    backgroundColor: '#f59e0b',
+                    boxShadow: '0 0 6px #f59e0b',
+                    display: 'inline-block'
+                  }} title="New update available" />
+                )}
               </div>
-              <div style={{ display: 'flex', gap: '6px', width: '100%' }}>
-                {status?.isBotRunning ? (
-                  <button 
-                    className="btn btn-danger" 
-                    style={{ flex: 1, padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }} 
-                    onClick={() => handleToggleBot(false)} 
-                    type="button"
-                  >
-                    <Pause size={11} /> Pause Bot
-                  </button>
-                ) : (
+
+              {/* Updater Status UI */}
+              {updateStatus === 'available' && (
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '4px',
+                  marginTop: '4px',
+                  background: 'rgba(59, 130, 246, 0.1)',
+                  border: '1px solid rgba(59, 130, 246, 0.15)',
+                  padding: '6px',
+                  borderRadius: '4px',
+                  width: '100%'
+                }}>
+                  <div style={{ fontSize: '0.62rem', color: '#60a5fa', fontWeight: 'bold' }}>New update: v{updateVersion}</div>
                   <button 
                     className="btn btn-success" 
-                    style={{ flex: 1, padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }} 
-                    onClick={() => handleToggleBot(true)} 
+                    style={{ padding: '2px 6px', fontSize: '0.6rem', height: '22px', border: 'none', borderRadius: '3px', cursor: 'pointer' }}
+                    onClick={() => window.electronAPI && window.electronAPI.startDownload()}
                     type="button"
                   >
-                    <Play size={11} /> Start Bot
+                    Download
                   </button>
-                )}
-                <button 
-                  className="btn btn-secondary" 
-                  style={{ padding: '5px 8px', fontSize: '0.7rem', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center' }} 
-                  onClick={handleResetPortfolio} 
-                  type="button"
-                >
-                  Reset
-                </button>
-              </div>
+                </div>
+              )}
+
+              {updateStatus === 'downloading' && (
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '4px',
+                  marginTop: '4px',
+                  background: 'rgba(255, 255, 255, 0.02)',
+                  border: '1px solid rgba(255, 255, 255, 0.05)',
+                  padding: '6px',
+                  borderRadius: '4px',
+                  width: '100%'
+                }}>
+                  <div style={{ fontSize: '0.62rem', color: 'var(--color-text-muted)', display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Downloading...</span>
+                    <span>{Math.round(downloadProgress)}%</span>
+                  </div>
+                  <div style={{ width: '100%', height: '3px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', overflow: 'hidden' }}>
+                    <div style={{ width: `${downloadProgress}%`, height: '100%', background: 'var(--color-success)' }} />
+                  </div>
+                </div>
+              )}
+
+              {updateStatus === 'downloaded' && (
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '4px',
+                  marginTop: '4px',
+                  background: 'rgba(34, 197, 94, 0.1)',
+                  border: '1px solid rgba(34, 197, 94, 0.15)',
+                  padding: '6px',
+                  borderRadius: '4px',
+                  width: '100%'
+                }}>
+                  <div style={{ fontSize: '0.62rem', color: '#4ade80', fontWeight: 'bold' }}>Update ready!</div>
+                  <button 
+                    className="btn btn-success" 
+                    style={{ padding: '2px 6px', fontSize: '0.6rem', height: '22px', border: 'none', borderRadius: '3px', cursor: 'pointer' }}
+                    onClick={() => window.electronAPI && window.electronAPI.quitAndInstall()}
+                    type="button"
+                  >
+                    Restart & Update
+                  </button>
+                </div>
+              )}
+
+              {updateStatus === 'error' && (
+                <div style={{
+                  fontSize: '0.6rem',
+                  color: 'var(--color-danger)',
+                  marginTop: '2px',
+                  paddingLeft: '4px'
+                }}>
+                  Update error
+                </div>
+              )}
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center', width: '100%' }}>
@@ -2149,6 +2302,39 @@ export default function App() {
                   <Play size={14} style={{ marginLeft: '1px' }} />
                 </button>
               )}
+              <div style={{
+                fontSize: '0.55rem',
+                color: 'var(--color-text-muted)',
+                opacity: 0.5,
+                textAlign: 'center',
+                fontFamily: 'var(--font-mono, monospace)',
+                marginTop: '2px',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '3px'
+              }}>
+                v{packageJson.version}
+                {updateStatus === 'downloaded' && (
+                  <span style={{
+                    width: '5px',
+                    height: '5px',
+                    borderRadius: '50%',
+                    backgroundColor: 'var(--color-success)',
+                    boxShadow: '0 0 5px var(--color-success)',
+                    display: 'inline-block'
+                  }} title="Update ready" />
+                )}
+                {updateStatus === 'available' && (
+                  <span style={{
+                    width: '5px',
+                    height: '5px',
+                    borderRadius: '50%',
+                    backgroundColor: '#f59e0b',
+                    boxShadow: '0 0 5px #f59e0b',
+                    display: 'inline-block'
+                  }} title="Update available" />
+                )}
+              </div>
             </div>
           )}
 
