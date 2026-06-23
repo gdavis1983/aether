@@ -1472,25 +1472,47 @@ function recalculatePaperFuturesPnL(db, currentPrice, assetName) {
  * Helper to resolve the correct CCXT swap/futures symbol
  */
 function getFuturesSymbol(exchange, symbol) {
-  if (symbol.includes(':')) return symbol;
+  if (symbol.includes(':')) {
+    // If it's already a resolved symbol, verify it is a swap/perp
+    if (exchange.markets && exchange.markets[symbol]) {
+      const market = exchange.markets[symbol];
+      if (market.swap || symbol.includes('PERP')) {
+        return symbol;
+      }
+      return null;
+    }
+    return symbol;
+  }
   if (exchange.markets) {
     const parts = symbol.split('/');
     const base = parts[0];
     const quote = parts[1] || 'USDC';
+    
+    // 1. Try exact matches for perpetual swaps
     const candidate1 = `${base}/${quote}:${quote}`;
-    if (exchange.markets[candidate1]) return candidate1;
+    if (exchange.markets[candidate1] && (exchange.markets[candidate1].swap || candidate1.includes('PERP'))) return candidate1;
     const candidate2 = `${base}/${quote}`;
-    if (exchange.markets[candidate2] && exchange.markets[candidate2].swap) return candidate2;
+    if (exchange.markets[candidate2] && (exchange.markets[candidate2].swap || candidate2.includes('PERP'))) return candidate2;
     const candidate3 = `${base}-${quote}-PERP`;
     if (exchange.markets[candidate3]) return candidate3;
+    
+    // 2. Loop through all markets to find any perpetual swap matching exact base and quote
     for (const key of Object.keys(exchange.markets)) {
       const market = exchange.markets[key];
-      if (market.base === base && market.quote === quote && (market.swap || market.future || key.includes('PERP'))) {
+      if (market.base === base && market.quote === quote && (market.swap || key.includes('PERP'))) {
+        return key;
+      }
+    }
+    
+    // 3. Broad search: Find any perpetual swap for this base currency (e.g. route XRP/USD -> XRP/USDC:USDC)
+    for (const key of Object.keys(exchange.markets)) {
+      const market = exchange.markets[key];
+      if (market.base === base && (market.swap || key.includes('PERP'))) {
         return key;
       }
     }
   }
-  return symbol;
+  return null; // Return null if no perpetual swap market can be resolved
 }
 
 /**
@@ -1600,8 +1622,11 @@ async function executeLivePerpTrade(exchange, action, amountPct, leverage, curre
       throw new Error(`Insufficient isolated futures margin balance in ${marginCurrency} (${availableMargin.toFixed(2)}) on ${exchange.id}.`);
     }
 
-    // Resolve futures symbol
+    // Resolve futures symbol (strictly perpetual swaps only)
     const futSymbol = getFuturesSymbol(exchange, symbol);
+    if (!futSymbol) {
+      throw new Error(`Only perpetual swaps (perps) are permitted. No active perpetual swap market was resolved on ${exchange.id} for base asset of ${symbol}.`);
+    }
 
     // Set leverage on exchange
     try {

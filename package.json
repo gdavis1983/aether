@@ -1,6 +1,6 @@
 {
   "name": "ai-crypto-trading-bot",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "An AI-powered cryptocurrency trading bot and dashboard with simulated paper trading and backtesting.",
   "main": "main.js",
   "scripts": {
