@@ -1,6 +1,6 @@
 {
   "name": "ai-crypto-trading-bot",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "An AI-powered cryptocurrency trading bot and dashboard with simulated paper trading and backtesting.",
   "main": "main.js",
   "scripts": {
@@ -38,6 +38,9 @@
       "preload.js",
       "backend/**",
       "!backend/node_modules/**",
+      "!backend/db.json",
+      "!backend/logs/**",
+      "!backend/scratch/**",
       "frontend/dist/**",
       "package.json",
       "Aether_Operations_Manual.md"
