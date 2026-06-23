@@ -74,4 +74,33 @@ Capping trade allocations in choppy ranges (maximum 30% size) while scaling up t
 * **v1.0.0 (Launch)**: Basic Express/React architecture. CCXT spot trading loop on Coinbase.
 * **v1.1.0 (Quantitative Controls)**: Added ATR stops, Trailing Stops, Take Profits, and two-way Telegram remote controls.
 * **v1.2.0 (Completed)**: Implemented ADX market regimes, RVol volume confirmation, Trade Memory Journaling, Telegram notification formatting, and this live-updating system manual.
-* **v1.3.0 (Active)**: Added running weighted average cost-basis math, 75% maximum position allocation cap, default-enabled Trailing and ATR Stops, Smart Token Bypass pre-screening, and completed user packaging/setup documentation (README.md).
+* **v1.3.0 (Completed)**: Added running weighted average cost-basis math, 75% maximum position allocation cap, default-enabled Trailing and ATR Stops, and Smart Token Bypass pre-screening.
+* **v1.0.4 (Active)**: Upgraded to Unboxed Boardroom autonomy, multi-desk wargaming, sandbox self-assembly, performance-calibrated voting weights, and integrated the auto-updater UI and running version indicator in the sidebar.
+
+---
+
+## Chapter 6: Obsidian Vault & Cognitive Boardroom Setup
+
+Aether uses **Obsidian** to store debates, run wargaming simulations, test hypotheses, and learn from past trades. To configure this integration:
+
+### Step 1: Create a Local Obsidian Vault
+1. Create a new empty folder on your computer where you want your trading knowledge base to live (e.g., `C:\Users\YourName\Documents\Aether_Brain_Vault`).
+2. Download and install **Obsidian** (from [obsidian.md](https://obsidian.md)).
+3. Open Obsidian, click **Open folder as vault**, and select the folder you just created.
+
+### Step 2: Link the Vault in Aether's Dashboard
+1. Open the Aether desktop application.
+2. Navigate to the **Settings** tab.
+3. Scroll to the **Obsidian Vault Path** field and paste the absolute path to your vault folder (e.g., `C:\Users\YourName\Documents\Aether_Brain_Vault`).
+4. Enter your **Gemini API Key** (and other LLM provider keys) under the API Key sections to power the boardroom desks.
+5. Click **Save Settings** at the bottom.
+
+### Step 3: Verify Automated Folder Initialization
+Once saved, Aether will automatically initialize the following directories in your vault:
+* `/Beliefs` — Contains `Strategy-Era-Active.md` (edit this file in Obsidian to write your custom rules in plain English; Aether will sync and enforce them on every cycle!).
+* `/Wargames` — Records the sequentially compiled 8-desk wargaming simulation debates.
+* `/Debates` — Records the high-frequency Trader vs. Critic consensus logs.
+* `/States` — Holds hourly snapshots of indicator conditions.
+* `/Trades` — Contains post-mortem takeaway lessons and results of closed positions.
+* `/Backtests` — Contains weekly parameters and code mutation reports from the Genetic Sizing Sandbox.
+* `/Hypotheses` — Contains proposed quantitative trading theories currently being backtested.
